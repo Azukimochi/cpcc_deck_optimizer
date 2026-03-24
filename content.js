@@ -196,6 +196,7 @@
         .cpcc-card{padding:8px 10px;margin:6px 0;border-radius:8px;background:rgba(255,255,255,.08)}
         .cpcc-muted{opacity:.85}
         .cpcc-score{font-weight:700;color:#93c5fd}
+        .cpcc-score-up{color:#fde047;text-shadow:0 0 14px rgba(253,224,71,.45), 0 0 2px rgba(255,255,255,.7)}
         .cpcc-title{font-weight:700;font-size:13px;margin-bottom:4px}
         .cpcc-sub{font-size:11px;opacity:.8}
         .cpcc-btns{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px}
@@ -1768,6 +1769,12 @@
     return totalScore;
   }
 
+  function calculateCurrentWorkPower(workName) {
+    const deck = getCardsCurrentlyInWork(workName);
+    if (!deck.length) return 0;
+    return evaluateDeck(deck, WORK_RULES[workName]).total || 0;
+  }
+
   // =========================
   // 実行
   // =========================
@@ -1882,10 +1889,13 @@
 
   function renderSingleWorkResult(workName, res) {
     const freshDetail = getFreshDeckDetail(workName, res.deck, res.detail);
+    const currentScore = calculateCurrentWorkPower(workName);
+    const isImproved = (res.score || 0) > currentScore;
     return `
       <div class="cpcc-card">
         <div class="cpcc-title">${escapeHtml(workName)} 単体最適</div>
-        <div class="cpcc-score">推定合計Power: ${formatNum(res.score)}</div>
+        <div class="cpcc-score ${isImproved ? 'cpcc-score-up' : ''}">推定合計Power: ${formatNum(res.score)}</div>
+        <div class="cpcc-sub">現在Power: ${formatNum(currentScore)}</div>
         <div class="cpcc-sub">候補数: ${res.candidateCount} / 探索数: ${formatNum(res.explored)}</div>
         <div class="cpcc-btns">
           <button class="green" data-cpcc-action="set-work" data-work="${escapeHtml(workName)}">このデッキを自動セット</button>
@@ -1899,6 +1909,8 @@
   function renderGlobalPlan(plan) {
     const rows = [];
     const shownWorks = WORK_ORDER.filter(name => state.works.find(w => w.name === name && w.unlocked));
+    const currentTotalScore = calculateCurrentGlobalPower(state.works);
+    const isTotalImproved = (plan.totalScore || 0) > currentTotalScore;
 
     for (const workName of shownWorks) {
       const item = plan.byWork[workName] || {
@@ -1907,11 +1919,14 @@
         detail: { total: 0, byCard: {} },
       };
       const freshDetail = getFreshDeckDetail(workName, item.deck, item.detail);
+      const currentScore = calculateCurrentWorkPower(workName);
+      const isImproved = (item.score || 0) > currentScore;
 
       rows.push(`
         <div class="cpcc-card">
           <div class="cpcc-title">${escapeHtml(workName)}</div>
-          <div class="cpcc-score">推定Power: ${formatNum(item.score || 0)}</div>
+          <div class="cpcc-score ${isImproved ? 'cpcc-score-up' : ''}">推定Power: ${formatNum(item.score || 0)}</div>
+          <div class="cpcc-sub">現在Power: ${formatNum(currentScore)}</div>
         </div>
         ${renderDeckCards(item.deck || [], freshDetail)}
       `);
@@ -1924,7 +1939,8 @@
     return `
       <div class="cpcc-card">
         <div class="cpcc-title">全ワーク最適化結果</div>
-        <div class="cpcc-score">合計推定Power: ${formatNum(plan.totalScore)}</div>
+        <div class="cpcc-score ${isTotalImproved ? 'cpcc-score-up' : ''}">合計推定Power: ${formatNum(plan.totalScore)}</div>
+        <div class="cpcc-sub">現在累計Power: ${formatNum(currentTotalScore)}</div>
         <div class="cpcc-sub">探索ノード: ${formatNum(plan.nodes)}</div>
         <div class="cpcc-sub">${searchedSummary}</div>
         <div class="cpcc-btns">
