@@ -15,6 +15,8 @@
     supporterKeep: 20,
     eachClubKeep: 6,
     topDeckOptionsPerWork: 120, // 各ワークで保持する候補デッキ数
+    maxCandidatesPerWork: 18,
+    optimizeYieldEvery: 400,
     autoStepDelay: 300,
     autoClickDelay: 220,
     autoClickDelayLong: 420,
@@ -792,36 +794,47 @@
     return [...set];
   }
 
-  function searchTopDeckOptions(cards, workName, maxKeep = CONFIG.topDeckOptionsPerWork) {
+  async function searchTopDeckOptions(cards, workName, maxKeep = CONFIG.topDeckOptionsPerWork) {
     const rule = WORK_RULES[workName];
     const candidates = buildCandidates(cards, rule)
-      .sort((a, b) => estimateCardValue(b, rule) - estimateCardValue(a, rule));
+      .sort((a, b) => estimateCardValue(b, rule) - estimateCardValue(a, rule))
+      .slice(0, CONFIG.maxCandidatesPerWork);
 
     const bestOptions = [];
     let explored = 0;
-
-    // 空デッキも候補に入れる
-    bestOptions.push({
+    const ticker = createOptimizationTicker();
+    const emptyOption = {
       workName,
       deck: [],
       score: 0,
       detail: { total: 0, byCard: {} },
       key: '',
       exploredAt: 0,
-    });
+    };
 
-    dfs([], 0);
+    await dfs([], 0);
 
-    bestOptions.sort((a, b) => b.score - a.score);
+    const options = [emptyOption, ...bestOptions]
+      .filter((option, index, arr) => arr.findIndex(x => x.key === option.key) === index)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, maxKeep);
+
+    if (!options.some(option => option.key === '')) {
+      options.push(emptyOption);
+    }
+
+    options.sort((a, b) => b.score - a.score);
     return {
       workName,
       rule,
       candidates,
-      options: bestOptions.slice(0, maxKeep),
+      options,
       explored,
     };
 
-    function dfs(deck, start) {
+    async function dfs(deck, start) {
+      await ticker.tick();
+
       // 0〜5枚を候補にする
       if (deck.length > 0) {
         explored++;
@@ -847,7 +860,7 @@
 
       for (let i = start; i < candidates.length; i++) {
         deck.push(candidates[i]);
-        dfs(deck, i + 1);
+        await dfs(deck, i + 1);
         deck.pop();
       }
     }
@@ -869,8 +882,8 @@
     if (arr.length > maxKeep) arr.length = maxKeep;
   }
 
-  function findBestSingleWork(cards, workName) {
-    const searched = searchTopDeckOptions(cards, workName, 1);
+  async function findBestSingleWork(cards, workName) {
+    const searched = await searchTopDeckOptions(cards, workName, 1);
     const top = searched.options[0] || { deck: [], score: 0, detail: { total: 0, byCard: {} } };
     return {
       workName,
@@ -882,18 +895,29 @@
     };
   }
 
-  function findGlobalBestAllocation(cards, works) {
+  async function findGlobalBestAllocation(cards, works) {
     const unlockedWorks = works.filter(w => w.unlocked).map(w => w.name);
-    const searchedByWork = unlockedWorks.map(workName => searchTopDeckOptions(cards, workName));
+    const searchedByWork = [];
+    for (const workName of unlockedWorks) {
+      searchedByWork.push(await searchTopDeckOptions(cards, workName));
+    }
 
     // 候補数が少ない順に並べた方が探索しやすい
     searchedByWork.sort((a, b) => a.options.length - b.options.length);
 
-    let bestScore = -Infinity;
-    let bestByWork = {};
+    let bestScore = 0;
+    let bestByWork = Object.fromEntries(unlockedWorks.map(workName => [workName, {
+      workName,
+      deck: [],
+      score: 0,
+      detail: { total: 0, byCard: {} },
+      key: '',
+      exploredAt: 0,
+    }]));
     let nodes = 0;
+    const ticker = createOptimizationTicker();
 
-    dfs(0, new Set(), {}, 0);
+    await dfs(0, new Set(), {}, 0);
 
     return {
       totalScore: bestScore,
@@ -902,7 +926,8 @@
       searchedByWork,
     };
 
-    function dfs(index, usedCardIds, currentByWork, currentScore) {
+    async function dfs(index, usedCardIds, currentByWork, currentScore) {
+      await ticker.tick();
       nodes++;
 
       if (index >= searchedByWork.length) {
@@ -929,7 +954,7 @@
         }
 
         currentByWork[item.workName] = option;
-        dfs(index + 1, usedCardIds, currentByWork, currentScore + option.score);
+        await dfs(index + 1, usedCardIds, currentByWork, currentScore + option.score);
 
         delete currentByWork[item.workName];
         for (const id of added) usedCardIds.delete(id);
@@ -964,7 +989,7 @@
   // 実行
   // =========================
 
-  function runSingleWork(workName) {
+  async function runSingleWork(workName) {
     if (!state.cards.length) reloadAll();
 
     const cardsForWork = [
@@ -972,22 +997,77 @@
       ...getCardsCurrentlyInWork(workName),
     ];
 
-    const res = findBestSingleWork(cardsForWork, workName);
+    setStatus(`${workName}: 最適化を計算中...`);
+    const res = await findBestSingleWork(cardsForWork, workName);
     state.singleResults[workName] = res;
 
     setResultHtml(renderSingleWorkResult(workName, res));
+    setStatus(`${workName}: 最適化が完了しました`);
   }
 
   async function runGlobalOptimization() {
-    if (!state.cards.length) reloadAll();
+    reloadAll();
 
-    setStatus('全ワーク最適化を計算中...');
-    const plan = findGlobalBestAllocation(state.cards, state.works);
-    state.globalPlan = plan;
+    const unlockedWorks = WORK_ORDER.filter(name => state.works.find(w => w.name === name && w.unlocked));
+    const byWork = {};
 
-    setResultHtml(renderGlobalPlan(plan));
-    setStatus('最適化結果を自動セットしています...');
-    await autoSetGlobalPlan(plan.byWork);
+    for (const workName of unlockedWorks) {
+      reloadAll();
+
+      const cardsForWork = [
+        ...state.cards,
+        ...getCardsCurrentlyInWork(workName),
+      ];
+
+      setStatus(`${workName}: 単体最適化を計算中...`);
+      const res = await findBestSingleWork(cardsForWork, workName);
+      state.singleResults[workName] = res;
+      byWork[workName] = res;
+
+      setResultHtml(renderGlobalPlan(buildMacroGlobalPlan(byWork, unlockedWorks)));
+      setStatus(`${workName}: 自動セットしています...`);
+      await autoSetWorkDeck(workName, res.deck);
+      reloadAll();
+    }
+
+    state.globalPlan = buildMacroGlobalPlan(byWork, unlockedWorks);
+    setResultHtml(renderGlobalPlan(state.globalPlan));
+    setStatus('全ワーク最適化マクロが完了しました');
+  }
+
+  function buildMacroGlobalPlan(byWork, unlockedWorks) {
+    const normalizedByWork = {};
+    let totalScore = 0;
+
+    for (const workName of unlockedWorks) {
+      const item = byWork[workName] || {
+        workName,
+        deck: [],
+        score: 0,
+        detail: { total: 0, byCard: {} },
+        candidateCount: 0,
+        explored: 0,
+      };
+
+      normalizedByWork[workName] = item;
+      totalScore += item.score || 0;
+    }
+
+    const searchedByWork = unlockedWorks.map(workName => {
+      const item = normalizedByWork[workName];
+      return {
+        workName,
+        options: item.deck?.length ? [item] : [],
+        explored: item.explored || 0,
+      };
+    });
+
+    return {
+      totalScore,
+      byWork: normalizedByWork,
+      nodes: searchedByWork.reduce((sum, item) => sum + (item.explored || 0), 0),
+      searchedByWork,
+    };
   }
 
   function renderSingleWorkResult(workName, res) {
@@ -1438,6 +1518,18 @@
       if (!targetClubs.has(e.club)) return s;
       return s + e.value;
     }, 0);
+  }
+
+  function createOptimizationTicker() {
+    let count = 0;
+    return {
+      async tick() {
+        count++;
+        if (count % CONFIG.optimizeYieldEvery === 0) {
+          await sleep(0);
+        }
+      },
+    };
   }
 
   function normalizeSpace(str) {
