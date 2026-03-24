@@ -29,9 +29,9 @@
     currentDeckSwapPoolKeep: 18,
     currentDeckPairSwapKeep: 8,
     synergyProgressEveryDecks: 1000,
-    autoStepDelay: 300,
-    autoClickDelay: 220,
-    autoClickDelayLong: 420,
+    autoStepDelay: 500,
+    autoClickDelay: 500,
+    autoClickDelayLong: 500,
   };
 
   const CLUBS = [
@@ -1238,6 +1238,15 @@
       pushBestOption(options, seedOption, maxKeep);
     }
 
+    if (!options.length) {
+      onProgress?.(`${workName}: 対象部活絞り込みで候補が見つからなかったため、広域探索へフォールバックします`);
+      const fallback = buildFallbackDeckOptions(cards, rule, workName, optionScan, maxKeep);
+      explored += fallback.explored;
+      for (const option of fallback.options) {
+        pushBestOption(options, option, maxKeep);
+      }
+    }
+
     const emptyOption = {
       workName,
       deck: [],
@@ -1259,6 +1268,46 @@
     };
     await saveSearchCache(cacheKey, cards, workName, result);
     return result;
+  }
+
+  function buildFallbackDeckOptions(cards, rule, workName, optionScan, maxKeep) {
+    const prefilteredCards = prefilterCardsForSearch(cards, rule, optionScan);
+    const analysis = createCardAnalysis(prefilteredCards, rule, optionScan);
+    const candidates = buildCandidates(prefilteredCards, rule, analysis, optionScan)
+      .slice(0, Math.max(14, CONFIG.candidateOverallKeep / 10));
+    const bestOptions = [];
+    let explored = 0;
+    if (candidates.length < 5) {
+      return { options: [], explored };
+    }
+
+    const picked = [];
+    function dfs(startIndex, left) {
+      if (left === 0) {
+        explored++;
+        const deck = [...picked];
+        const detail = evaluateDeck(deck, rule);
+        pushBestOption(bestOptions, {
+          workName,
+          deck,
+          score: detail.total,
+          detail,
+          key: buildDeckKey(deck),
+          exploredAt: explored,
+        }, maxKeep);
+        return;
+      }
+
+      const limit = candidates.length - left;
+      for (let i = startIndex; i <= limit; i++) {
+        picked.push(candidates[i]);
+        dfs(i + 1, left - 1);
+        picked.pop();
+      }
+    }
+
+    dfs(0, 5);
+    return { options: bestOptions, explored };
   }
 
   function getFocusClubsForWork(cards, rule, optionScan) {
@@ -1626,7 +1675,11 @@
     dfs(0, 0);
 
     if (!bestPlan) {
-      throw new Error('全ワークで重複なしの組み合わせが見つかりませんでした');
+      const fallbackPlan = await buildSequentialGlobalFallback(cards, unlockedWorks, currentDeckByWork, onProgress);
+      if (!fallbackPlan) {
+        throw new Error('全ワークで重複なしの組み合わせが見つかりませんでした');
+      }
+      bestPlan = fallbackPlan;
     }
 
     return {
@@ -1666,6 +1719,30 @@
         for (const card of option.deck) usedIds.delete(card.id);
       }
     }
+  }
+
+  async function buildSequentialGlobalFallback(cards, unlockedWorks, currentDeckByWork, onProgress = null) {
+    const byWork = {};
+    let totalScore = 0;
+    let remainingCards = [...cards];
+
+    for (const workName of unlockedWorks) {
+      onProgress?.(`全ワーク組み合わせ探索: ${workName} を逐次フォールバック探索中`);
+      const searched = await searchTopDeckOptions(remainingCards, workName, CONFIG.topDeckOptionsPerWork, null, {
+        seedDeck: currentDeckByWork[workName] || [],
+      });
+      const option = findBestNonEmptyOption(searched.options);
+      if (!option) {
+        return null;
+      }
+
+      byWork[workName] = option;
+      totalScore += option.score || 0;
+      remainingCards = removeSelectedCards(remainingCards, option.deck);
+      onProgress?.(`全ワーク組み合わせ探索: ${workName} は逐次フォールバック候補を採用しました`);
+    }
+
+    return { totalScore, byWork };
   }
 
   function getOrderedUnlockedWorks(works) {
