@@ -216,6 +216,40 @@
   }
 
   function bindResultButtons() {
+    document.querySelectorAll('[data-cpcc-action="set-work"]').forEach(btn => {
+      btn.onclick = async () => {
+        const workName = btn.dataset.work;
+        const plan = state.singleResults?.[workName] || state.globalPlan?.byWork?.[workName];
+        if (!plan) {
+          alert('先に対象ワークの最適化を実行してください');
+          return;
+        }
+
+        btn.disabled = true;
+        try {
+          await autoSetWorkDeck(workName, plan.deck);
+        } finally {
+          btn.disabled = false;
+        }
+      };
+    });
+
+    document.querySelectorAll('[data-cpcc-action="set-global"]').forEach(btn => {
+      btn.onclick = async () => {
+        if (!state.globalPlan?.byWork) {
+          alert('先に全ワーク最適化を実行してください');
+          return;
+        }
+
+        btn.disabled = true;
+        try {
+          await autoSetGlobalPlan(state.globalPlan.byWork);
+        } finally {
+          btn.disabled = false;
+        }
+      };
+    });
+
     document.querySelectorAll('[data-cpcc-action="highlight-work"]').forEach(btn => {
       btn.onclick = () => {
         const workName = btn.dataset.work;
@@ -521,6 +555,22 @@
 
   function getCardSignatureKey(card) {
     return [card.name, card.power, card.club, card.rarity].join('__');
+  }
+
+  function getCardsCurrentlyInWork(workName) {
+    const root = findWorkRoot(workName);
+    if (!root) return [];
+
+    return findFilledWorkCardRoots(root)
+      .map((cardRoot, index) => {
+        const card = parseCardFromRoot(cardRoot, `work-${workName}-${index}`);
+        if (!card) return null;
+        return {
+          ...card,
+          inDeck: false,
+        };
+      })
+      .filter(Boolean);
   }
 
   function collectUsedCardCounts() {
@@ -916,19 +966,27 @@
   function runSingleWork(workName) {
     if (!state.cards.length) reloadAll();
 
-    const res = findBestSingleWork(state.cards, workName);
+    const cardsForWork = [
+      ...state.cards,
+      ...getCardsCurrentlyInWork(workName),
+    ];
+
+    const res = findBestSingleWork(cardsForWork, workName);
     state.singleResults[workName] = res;
 
     setResultHtml(renderSingleWorkResult(workName, res));
   }
 
-  function runGlobalOptimization() {
+  async function runGlobalOptimization() {
     if (!state.cards.length) reloadAll();
 
+    setStatus('全ワーク最適化を計算中...');
     const plan = findGlobalBestAllocation(state.cards, state.works);
     state.globalPlan = plan;
 
     setResultHtml(renderGlobalPlan(plan));
+    setStatus('最適化結果を自動セットしています...');
+    await autoSetGlobalPlan(plan.byWork);
   }
 
   function renderSingleWorkResult(workName, res) {
@@ -938,6 +996,7 @@
         <div class="cpcc-score">推定合計Power: ${formatNum(res.score)}</div>
         <div class="cpcc-sub">候補数: ${res.candidateCount} / 探索数: ${formatNum(res.explored)}</div>
         <div class="cpcc-btns">
+          <button class="green" data-cpcc-action="set-work" data-work="${escapeHtml(workName)}">このデッキを自動セット</button>
           <button class="green" data-cpcc-action="highlight-work" data-work="${escapeHtml(workName)}">このデッキをハイライト</button>
         </div>
       </div>
@@ -1051,27 +1110,25 @@
     }
 
     setStatus(`${workName}: ${deck.length} 枚をセット中...`);
-    const usedRoots = new Set();
+    await activateWorkBase(workName);
 
     for (const card of deck) {
-      const slot = findNextEmptySlot(work.root);
-      if (!slot) {
-        console.warn('[CPCC] empty slot not found', workName);
-        setStatus(`${workName}: 空きスロットが見つかりません`);
+      const currentRoot = findWorkRoot(workName);
+      const countBefore = currentRoot ? parseCurrentCount(currentRoot) : 0;
+      if (countBefore >= 5) {
+        console.warn('[CPCC] deck already full', workName, countBefore);
+        setStatus(`${workName}: 既に5枚入っています`);
         break;
       }
 
-      console.log('[CPCC] click slot', workName, card.name, slot);
-      simulateClick(slot);
-      await sleep(500);
+      await activateWorkBase(workName);
 
-      const cardRoot = findOwnedCardRootForSelectionEx(card, { excludeRoots: usedRoots });
+      const cardRoot = findOwnedCardRootForSelectionEx(card, { excludeInDeck: true });
       if (!cardRoot) {
         console.warn('[CPCC] owned card root not found', card);
         setStatus(`${workName}: カードが見つかりません ${card.name}`);
         continue;
       }
-      usedRoots.add(cardRoot);
 
       const target = findClickableCardTarget(cardRoot);
       if (!target) {
@@ -1080,15 +1137,14 @@
         continue;
       }
 
-      console.log('[CPCC] click card', card.name, target);
-      highlightElement(slot, 'lime');
+      console.log('[CPCC] click card', workName, card.name, target);
       simulateClick(target);
-      await sleep(700);
       highlightElement(target, 'red');
-
-      // 本当にセットされたか軽く確認
-      const countNow = parseCurrentCount(findWorkRoot(workName));
-      console.log('[CPCC] current count', workName, countNow);
+      const changed = await waitForWorkCount(workName, countBefore + 1, 2500);
+      if (!changed) {
+        console.warn('[CPCC] count did not increase', workName, card);
+        await sleep(CONFIG.autoClickDelayLong);
+      }
     }
 
     setStatus(`${workName}: 自動セット完了`);
@@ -1111,22 +1167,55 @@
     if (currentCount <= 0) return;
 
     setStatus(`${workName}: 既存カードを外しています...`);
+    await activateWorkBase(workName);
 
-    // ワーク内の大きいカード画像をクリックして外す想定
-    // ページ仕様変更時はここを調整
     for (let loop = 0; loop < 8; loop++) {
-      const cardTargets = findFilledWorkCardTargets(workRoot);
+      await activateWorkBase(workName);
+      const rootNow = findWorkRoot(workName);
+      const countBefore = rootNow ? parseCurrentCount(rootNow) : 0;
+      const cardTargets = rootNow ? findFilledWorkCardRoots(rootNow) : [];
       if (!cardTargets.length) break;
 
       for (const target of cardTargets) {
         simulateClick(target);
-        await sleep(CONFIG.autoClickDelayLong);
+        highlightElement(target, 'orange');
+        const changed = await waitForWorkCount(workName, Math.max(0, countBefore - 1), 2500);
+        if (!changed) {
+          await sleep(CONFIG.autoClickDelayLong);
+        }
+        break;
       }
-
-      await sleep(CONFIG.autoClickDelayLong);
-
-      if (parseCurrentCount(workRoot) === 0) break;
+      const countNow = parseCurrentCount(findWorkRoot(workName));
+      if (countNow === 0) break;
     }
+  }
+
+  async function activateWorkBase(workName) {
+    const workRoot = findWorkRoot(workName);
+    if (!workRoot) return false;
+
+    if (workRoot.classList.contains('active-base')) return true;
+
+    const header = workRoot.querySelector('.base-header') || workRoot;
+    simulateClick(header);
+    await waitUntil(() => workRoot.classList.contains('active-base'), 800);
+    return workRoot.classList.contains('active-base');
+  }
+
+  async function waitForWorkCount(workName, expectedCount, timeoutMs = 2000) {
+    return waitUntil(() => {
+      const root = findWorkRoot(workName);
+      return !!root && parseCurrentCount(root) === expectedCount;
+    }, timeoutMs);
+  }
+
+  async function waitUntil(checkFn, timeoutMs = 1500, intervalMs = 80) {
+    const started = Date.now();
+    while ((Date.now() - started) < timeoutMs) {
+      if (checkFn()) return true;
+      await sleep(intervalMs);
+    }
+    return checkFn();
   }
 
   function findNextEmptySlot(workRoot) {
@@ -1183,6 +1272,7 @@
 
   function findOwnedCardRootForSelectionEx(card, opts = {}) {
     const excludeRoots = opts.excludeRoots || new Set();
+    const excludeInDeck = !!opts.excludeInDeck;
     const rememberedRoots = [
       card?.root,
       state.cards.find(c => c.id === card.id)?.root,
@@ -1190,10 +1280,15 @@
 
     for (const root of rememberedRoots) {
       if (excludeRoots.has(root)) continue;
+      if (excludeInDeck && root.classList.contains('in-deck')) continue;
       if (isMatchingCardRoot(root, card)) return root;
     }
 
-    const roots = findOwnedCardRoots().filter(root => !excludeRoots.has(root));
+    const roots = findOwnedCardRoots().filter(root => {
+      if (excludeRoots.has(root)) return false;
+      if (excludeInDeck && root.classList.contains('in-deck')) return false;
+      return true;
+    });
 
     // まずは厳密一致
     let exact = roots.find(root => {
