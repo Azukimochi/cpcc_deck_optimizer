@@ -743,7 +743,10 @@
     return { total, byCard };
   }
 
-  function estimateCardValue(card, rule) {
+  function estimateCardValue(card, rule, analysis = null) {
+    const cached = analysis?.byId?.get(card.id);
+    if (cached) return cached.estimateCardValue;
+
     const baseScore = applyWorkBase(card, rule);
     const tier = getCardTierProfile(card, rule);
     let score = baseScore;
@@ -810,13 +813,97 @@
     return score;
   }
 
-  function buildCandidates(cards, rule) {
-    return [...cards].sort((a, b) => estimateCardValue(b, rule) - estimateCardValue(a, rule));
+  function createCardAnalysis(cards, rule) {
+    const byId = new Map();
+    const targetClubs = new Set(rule.clubs || []);
+
+    for (const card of cards) {
+      const baseScore = applyWorkBase(card, rule);
+      const tier = getCardTierProfile(card, rule);
+      let ownPositive = 0;
+      let ownNegative = 0;
+      let relevantPositive = 0;
+      let relevantNegative = 0;
+      let otherPositive = 0;
+      let otherNegative = 0;
+      let positiveTotal = 0;
+      let positiveSlots = 0;
+
+      for (const eff of card.effects) {
+        if (eff.value >= 0) {
+          positiveTotal += eff.value;
+          positiveSlots += eff.value > 0 ? 1 : 0;
+          if (eff.club === card.club) ownPositive += eff.value;
+          else if (targetClubs.has(eff.club)) relevantPositive += eff.value;
+          else otherPositive += eff.value;
+        } else {
+          if (eff.club === card.club) ownNegative += Math.abs(eff.value);
+          else if (targetClubs.has(eff.club)) relevantNegative += Math.abs(eff.value);
+          else otherNegative += Math.abs(eff.value);
+        }
+      }
+
+      let estimate = baseScore;
+      estimate += ownPositive * 9;
+      estimate += relevantPositive * 5;
+      estimate += otherPositive * 1.5;
+      estimate -= ownNegative * 7;
+      estimate -= relevantNegative * 4;
+      estimate -= otherNegative * 1.2;
+
+      if ((rule.type === 'clubMultiplier' || rule.type === 'onlyClub') && targetClubs.has(card.club)) {
+        estimate += ownPositive * 4;
+        estimate += baseScore * 0.35;
+      }
+
+      if (rule.type === 'rarityMultiplier' && rule.rarities?.includes(card.rarity)) {
+        estimate += ownPositive * 2;
+        estimate += relevantPositive * 1.5;
+      }
+
+      if (rule.type === 'minPower') {
+        if (card.power < rule.minPower) {
+          estimate += (rule.minPower - card.power) * 1.6;
+          estimate += (ownPositive * 3.5) + (relevantPositive * 1.5);
+        }
+        estimate += ownPositive * 2.5;
+      }
+
+      if (card.effects.length === 0) {
+        estimate -= Math.max(80, baseScore * 0.35);
+      } else if ((ownPositive + relevantPositive + otherPositive) === 0) {
+        estimate -= Math.max(120, baseScore * 0.45);
+      }
+
+      if (ownPositive >= 100) {
+        estimate += baseScore * (ownPositive / 100) * 0.45;
+      }
+
+      estimate += tier.score;
+
+      byId.set(card.id, {
+        baseScore,
+        tier,
+        ownPositive,
+        relevantPositive,
+        otherPositive,
+        positiveTotal,
+        positiveSlots,
+        estimateCardValue: estimate,
+      });
+    }
+
+    return { byId };
+  }
+
+  function buildCandidates(cards, rule, analysis = null) {
+    return [...cards].sort((a, b) => estimateCardValue(b, rule, analysis) - estimateCardValue(a, rule, analysis));
   }
 
   async function searchTopDeckOptions(cards, workName, maxKeep = CONFIG.topDeckOptionsPerWork, onProgress = null) {
     const rule = WORK_RULES[workName];
-    const candidates = buildCandidates(cards, rule);
+    const analysis = createCardAnalysis(cards, rule);
+    const candidates = buildCandidates(cards, rule, analysis);
     const emptyOption = {
       workName,
       deck: [],
@@ -837,7 +924,7 @@
     }
 
     const progress = createSynergySearchProgress(workName, onProgress);
-    const exactResult = await enumerateTopDeckOptionsBySynergy(candidates, rule, {
+    const exactResult = await enumerateTopDeckOptionsBySynergy(candidates, rule, analysis, {
       maxKeep,
       workName,
       onProgress: progress.report,
@@ -862,18 +949,19 @@
     };
   }
 
-  async function enumerateTopDeckOptionsBySynergy(candidates, rule, { maxKeep, workName, onProgress }) {
+  async function enumerateTopDeckOptionsBySynergy(candidates, rule, analysis, { maxKeep, workName, onProgress }) {
     const bestOptions = [];
     const ticker = createOptimizationTicker();
+    const seenDeckKeys = new Set();
     let explored = 0;
     let processedGroups = 0;
-    const anchorCards = buildAnchorCards(candidates, rule);
-    const anchorPairs = buildAnchorPairs(anchorCards, rule);
+    const anchorCards = buildAnchorCards(candidates, rule, analysis);
+    const anchorPairs = buildAnchorPairs(anchorCards, rule, analysis);
     const generalCore = candidates.slice(0, CONFIG.synergyGeneralKeep);
 
     for (const anchor of anchorCards) {
       await ticker.tick();
-      const pool = buildSynergyPool(anchor.deck, candidates, rule, generalCore);
+      const pool = buildSynergyPool(anchor.deck, candidates, rule, analysis, generalCore);
       await enumerateDecksFromPool(anchor.deck, pool);
       processedGroups++;
       onProgress?.({
@@ -886,7 +974,7 @@
 
     for (const anchor of anchorPairs) {
       await ticker.tick();
-      const pool = buildSynergyPool(anchor.deck, candidates, rule, generalCore);
+      const pool = buildSynergyPool(anchor.deck, candidates, rule, analysis, generalCore);
       await enumerateDecksFromPool(anchor.deck, pool);
       processedGroups++;
       onProgress?.({
@@ -931,6 +1019,10 @@
     }
 
     function pushDeckOption(deck) {
+      const key = deck.map(c => c.id).sort().join('|');
+      if (seenDeckKeys.has(key)) return;
+      seenDeckKeys.add(key);
+
       explored++;
       if (explored === 1 || explored % CONFIG.synergyProgressEveryDecks === 0) {
         onProgress?.({
@@ -947,23 +1039,23 @@
         deck: [...deck],
         score: detail.total,
         detail,
-        key: deck.map(c => c.id).sort().join('|'),
+        key,
         exploredAt: explored,
       }, maxKeep);
     }
   }
 
-  function buildAnchorCards(candidates, rule) {
+  function buildAnchorCards(candidates, rule, analysis) {
     return candidates
       .map(card => ({
         deck: [card],
-        score: estimateAnchorStrength(card, rule),
+        score: estimateAnchorStrength(card, rule, analysis),
       }))
       .sort((a, b) => b.score - a.score)
       .slice(0, Math.min(CONFIG.synergyAnchorKeep, candidates.length));
   }
 
-  function buildAnchorPairs(anchorCards, rule) {
+  function buildAnchorPairs(anchorCards, rule, analysis) {
     const pairSource = anchorCards.slice(0, Math.min(CONFIG.synergyPairAnchorKeep, anchorCards.length));
     const pairs = [];
 
@@ -973,7 +1065,7 @@
         const second = pairSource[j].deck[0];
         pairs.push({
           deck: [first, second],
-          score: estimatePairAnchorStrength(first, second, rule),
+          score: estimatePairAnchorStrength(first, second, rule, analysis),
         });
       }
     }
@@ -983,7 +1075,7 @@
       .slice(0, CONFIG.synergyPairAnchorKeep);
   }
 
-  function buildSynergyPool(anchorDeck, candidates, rule, generalCore) {
+  function buildSynergyPool(anchorDeck, candidates, rule, analysis, generalCore) {
     const anchorIds = new Set(anchorDeck.map(card => card.id));
     const pool = [];
     const seen = new Set(anchorIds);
@@ -1006,7 +1098,7 @@
       .filter(card => !anchorIds.has(card.id))
       .map(card => ({
         card,
-        score: estimateSynergyWithAnchor(card, anchorDeck, rule),
+        score: estimateSynergyWithAnchor(card, anchorDeck, rule, analysis),
       }))
       .sort((a, b) => b.score - a.score);
 
@@ -1022,21 +1114,22 @@
     return pool.slice(0, Math.max(CONFIG.synergyPoolKeep, 10));
   }
 
-  function estimateAnchorStrength(card, rule) {
-    const positiveTotal = card.effects.reduce((sum, eff) => sum + Math.max(0, eff.value), 0);
-    const positiveSlots = card.effects.reduce((sum, eff) => sum + (eff.value > 0 ? 1 : 0), 0);
-    const ownPositive = totalPositiveBuffForClub(card, card.club);
-    return estimateCardValue(card, rule) + positiveTotal * 3 + positiveSlots * 800 + ownPositive * 2;
+  function estimateAnchorStrength(card, rule, analysis = null) {
+    const info = analysis?.byId?.get(card.id);
+    const positiveTotal = info?.positiveTotal ?? card.effects.reduce((sum, eff) => sum + Math.max(0, eff.value), 0);
+    const positiveSlots = info?.positiveSlots ?? card.effects.reduce((sum, eff) => sum + (eff.value > 0 ? 1 : 0), 0);
+    const ownPositive = info?.ownPositive ?? totalPositiveBuffForClub(card, card.club);
+    return estimateCardValue(card, rule, analysis) + positiveTotal * 3 + positiveSlots * 800 + ownPositive * 2;
   }
 
-  function estimatePairAnchorStrength(cardA, cardB, rule) {
-    const base = estimateAnchorStrength(cardA, rule) + estimateAnchorStrength(cardB, rule);
-    const synergy = estimateSynergyWithAnchor(cardA, [cardB], rule) + estimateSynergyWithAnchor(cardB, [cardA], rule);
+  function estimatePairAnchorStrength(cardA, cardB, rule, analysis = null) {
+    const base = estimateAnchorStrength(cardA, rule, analysis) + estimateAnchorStrength(cardB, rule, analysis);
+    const synergy = estimateSynergyWithAnchor(cardA, [cardB], rule, analysis) + estimateSynergyWithAnchor(cardB, [cardA], rule, analysis);
     return base + synergy;
   }
 
-  function estimateSynergyWithAnchor(card, anchorDeck, rule) {
-    let score = estimateCardValue(card, rule);
+  function estimateSynergyWithAnchor(card, anchorDeck, rule, analysis = null) {
+    let score = estimateCardValue(card, rule, analysis);
     const targetClubs = new Set(rule.clubs || []);
 
     for (const anchor of anchorDeck) {
@@ -1188,6 +1281,14 @@
     }]));
     let nodes = 0;
     const ticker = createOptimizationTicker();
+    const stateCache = new Map();
+    const cardIndexById = new Map();
+
+    for (const card of cards) {
+      if (!cardIndexById.has(card.id)) {
+        cardIndexById.set(card.id, cardIndexById.size);
+      }
+    }
 
     await dfs(0, new Set(), {}, 0);
 
@@ -1212,6 +1313,11 @@
         }
         return;
       }
+
+      const stateKey = makeAllocationStateKey(index, usedCardIds, cardIndexById);
+      const cachedBest = stateCache.get(stateKey);
+      if (cachedBest != null && cachedBest >= currentScore) return;
+      stateCache.set(stateKey, currentScore);
 
       const optimistic = currentScore + sumRemainingBest(index);
       if (optimistic <= bestScore) return;
@@ -1243,6 +1349,16 @@
       }
       return s;
     }
+  }
+
+  function makeAllocationStateKey(index, usedCardIds, cardIndexById) {
+    const used = [];
+    for (const id of usedCardIds) {
+      const idx = cardIndexById.get(id);
+      if (idx != null) used.push(idx);
+    }
+    used.sort((a, b) => a - b);
+    return `${index}:${used.join(',')}`;
   }
 
   function canUseOption(option, usedCardIds) {
