@@ -783,6 +783,7 @@
       const afterClubBonus = Math.max(0, basePower + bonusPower);
       const finalPower = applyWorkPower(afterClubBonus, card, rule);
       const fieldPower = finalPower - afterClubBonus;
+      const fieldLabel = describeFieldEffect(card, rule, afterClubBonus, finalPower);
 
       byCard[card.id] = {
         bonusPercent: clubBonus,
@@ -791,6 +792,7 @@
         afterClubBonus,
         fieldPower,
         finalPower,
+        fieldLabel,
       };
       totalRaw += finalPower;
     }
@@ -800,6 +802,28 @@
       totalRaw,
       byCard,
     };
+  }
+
+  function describeFieldEffect(card, rule, afterClubBonus, finalPower) {
+    if (!rule) return 'なし';
+
+    if (rule.type === 'minPower') {
+      return afterClubBonus < rule.minPower ? `最低${rule.minPower}` : 'なし';
+    }
+
+    if (rule.type === 'rarityMultiplier' && rule.rarities?.includes(card.rarity)) {
+      return `x${rule.multiplier}`;
+    }
+
+    if (rule.type === 'clubMultiplier' && rule.clubs?.includes(card.club)) {
+      return `x${rule.multiplier}`;
+    }
+
+    if (rule.type === 'onlyClub') {
+      return finalPower > 0 ? '適用' : '対象外';
+    }
+
+    return 'なし';
   }
 
   function estimateCardValue(card, rule, analysis = null) {
@@ -1603,6 +1627,7 @@
   }
 
   function renderSingleWorkResult(workName, res) {
+    const freshDetail = getFreshDeckDetail(workName, res.deck, res.detail);
     return `
       <div class="cpcc-card">
         <div class="cpcc-title">${escapeHtml(workName)} 単体最適</div>
@@ -1613,7 +1638,7 @@
           <button class="green" data-cpcc-action="highlight-work" data-work="${escapeHtml(workName)}">このデッキをハイライト</button>
         </div>
       </div>
-      ${renderDeckCards(res.deck || [], res.detail || { byCard: {} })}
+      ${renderDeckCards(res.deck || [], freshDetail)}
     `;
   }
 
@@ -1627,13 +1652,14 @@
         score: 0,
         detail: { total: 0, byCard: {} },
       };
+      const freshDetail = getFreshDeckDetail(workName, item.deck, item.detail);
 
       rows.push(`
         <div class="cpcc-card">
           <div class="cpcc-title">${escapeHtml(workName)}</div>
           <div class="cpcc-score">推定Power: ${formatNum(item.score || 0)}</div>
         </div>
-        ${renderDeckCards(item.deck || [], item.detail || { byCard: {} })}
+        ${renderDeckCards(item.deck || [], freshDetail)}
       `);
     }
 
@@ -1664,7 +1690,7 @@
     const seenKeys = new Map();
 
     return deck.map(c => {
-      const d = detail?.byCard?.[c.id] || { bonusPercent: 0, basePower: c.power, bonusPower: 0, afterClubBonus: c.power, fieldPower: 0, finalPower: c.power };
+      const d = detail?.byCard?.[c.id] || { bonusPercent: 0, basePower: c.power, bonusPower: 0, afterClubBonus: c.power, fieldPower: 0, finalPower: c.power, fieldLabel: 'なし' };
       const key = getCardSignatureKey(c);
       const occurrence = (seenKeys.get(key) || 0) + 1;
       seenKeys.set(key, occurrence);
@@ -1685,10 +1711,17 @@
         <div class="cpcc-title">${escapeHtml(c.name)} <span class="cpcc-sub">[${escapeHtml(c.rarity)}]</span></div>
         <div>部活: ${escapeHtml(c.club)} / 基礎Power: ${c.power}</div>
         <div>基礎Power: ${formatNum(d.basePower)} / 部活補正: ${d.bonusPercent > 0 ? '+' : ''}${d.bonusPercent}% ${bonusPowerText}</div>
-        <div>場効果: ${fieldPowerText} / 場効果後: ${formatNum(d.finalPower)}</div>
+        <div>場効果: ${escapeHtml(d.fieldLabel || 'なし')} ${fieldPowerText} / 場効果後: ${formatNum(d.finalPower)}</div>
       </div>
     `;
     }).join('');
+  }
+
+  function getFreshDeckDetail(workName, deck, fallbackDetail = null) {
+    if (!deck?.length) return fallbackDetail || { byCard: {} };
+    const rule = WORK_RULES[workName];
+    if (!rule) return fallbackDetail || { byCard: {} };
+    return evaluateDeck(deck, rule);
   }
 
   // =========================
