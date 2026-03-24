@@ -12,6 +12,10 @@
   const CONFIG = {
     topDeckOptionsPerWork: 120, // 各ワークで保持する候補デッキ数
     optimizeYieldEvery: 250,
+    candidateOverallKeep: 180,
+    candidatePerClubKeep: 24,
+    candidateFocusClubCount: 8,
+    candidateMinPowerExtraKeep: 36,
     synergyAnchorKeep: 100,
     synergyPairAnchorKeep: 24,
     synergyPoolKeep: 18,
@@ -727,14 +731,14 @@
     }
 
     const byCard = {};
-    let total = 0;
+    let totalRaw = 0;
 
     for (const card of deck) {
       const clubBonus = buffByClub.get(card.club) || 0;
       const basePower = card.power;
-      const bonusPower = Math.floor(basePower * (clubBonus / 100));
+      const bonusPower = basePower * (clubBonus / 100);
       const afterClubBonus = Math.max(0, basePower + bonusPower);
-      const finalPower = roundPower(applyWorkPower(afterClubBonus, card, rule));
+      const finalPower = applyWorkPower(afterClubBonus, card, rule);
       const fieldPower = finalPower - afterClubBonus;
 
       byCard[card.id] = {
@@ -745,10 +749,14 @@
         fieldPower,
         finalPower,
       };
-      total += finalPower;
+      totalRaw += finalPower;
     }
 
-    return { total, byCard };
+    return {
+      total: roundPower(totalRaw),
+      totalRaw,
+      byCard,
+    };
   }
 
   function estimateCardValue(card, rule, analysis = null) {
@@ -892,6 +900,7 @@
       byId.set(card.id, {
         baseScore,
         tier,
+        focusClub: tier.focusClub,
         ownPositive,
         relevantPositive,
         otherPositive,
@@ -905,7 +914,55 @@
   }
 
   function buildCandidates(cards, rule, analysis = null) {
-    return [...cards].sort((a, b) => estimateCardValue(b, rule, analysis) - estimateCardValue(a, rule, analysis));
+    const ranked = [...cards].sort((a, b) => estimateCardValue(b, rule, analysis) - estimateCardValue(a, rule, analysis));
+    const picked = [];
+    const seen = new Set();
+
+    const pushCard = (card) => {
+      if (!card || seen.has(card.id)) return;
+      seen.add(card.id);
+      picked.push(card);
+    };
+
+    ranked.slice(0, CONFIG.candidateOverallKeep).forEach(pushCard);
+
+    for (const club of getCandidateFocusClubs(ranked, rule, analysis)) {
+      ranked
+        .filter(card => {
+          const info = analysis?.byId?.get(card.id);
+          return card.club === club || info?.focusClub === club;
+        })
+        .slice(0, CONFIG.candidatePerClubKeep)
+        .forEach(pushCard);
+    }
+
+    if (rule.type === 'minPower') {
+      ranked
+        .filter(card => card.power < rule.minPower)
+        .slice(0, CONFIG.candidateMinPowerExtraKeep)
+        .forEach(pushCard);
+    }
+
+    return picked;
+  }
+
+  function getCandidateFocusClubs(rankedCards, rule, analysis = null) {
+    if (rule.clubs?.length) return [...new Set(rule.clubs)];
+
+    const scores = new Map();
+    for (const card of rankedCards.slice(0, CONFIG.candidateOverallKeep)) {
+      const info = analysis?.byId?.get(card.id);
+      const estimate = info?.estimateCardValue ?? 0;
+      const clubs = [card.club, info?.focusClub].filter(Boolean);
+      for (const club of clubs) {
+        scores.set(club, (scores.get(club) || 0) + estimate);
+      }
+    }
+
+    return [...scores.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, CONFIG.candidateFocusClubCount)
+      .map(([club]) => club);
   }
 
   async function searchTopDeckOptions(cards, workName, maxKeep = CONFIG.topDeckOptionsPerWork, onProgress = null) {
@@ -1500,7 +1557,16 @@
   async function autoSetGlobalPlan(byWork) {
     setStatus('全プラン自動セットを開始します...');
 
-    for (const workName of WORK_ORDER) {
+    const targetWorks = getOrderedUnlockedWorks(state.works);
+
+    for (const workName of targetWorks) {
+      if (!byWork[workName]) continue;
+      await clearWorkDeck(workName);
+    }
+
+    reloadAll();
+
+    for (const workName of targetWorks) {
       const item = byWork[workName];
       if (!item) continue;
       await autoSetWorkDeck(workName, item.deck);
