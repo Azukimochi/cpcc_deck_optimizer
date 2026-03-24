@@ -12,7 +12,7 @@
   const CONFIG = {
     topDeckOptionsPerWork: 120, // 各ワークで保持する候補デッキ数
     optimizeYieldEvery: 250,
-    storageCacheVersion: 2,
+    storageCacheVersion: 3,
     storageCacheMaxEntries: 300,
     prefilterOverallKeep: 260,
     prefilterPerClubKeep: 32,
@@ -1192,9 +1192,52 @@
     }
 
     const optionScan = await getOrCreateOptionScan(cards);
-    const prefilteredCards = prefilterCardsForSearch(cards, rule, optionScan);
-    const analysis = createCardAnalysis(prefilteredCards, rule, optionScan);
-    const candidates = buildCandidates(prefilteredCards, rule, analysis, optionScan);
+    const focusClubs = getFocusClubsForWork(cards, rule, optionScan);
+    const options = [];
+    let explored = 0;
+    let processedGroups = 0;
+
+    for (const focusClub of focusClubs) {
+      const pool = buildFocusedPool(cards, focusClub, rule, optionScan);
+      const baseOption = findBestDeckFromFocusedPool(pool, rule, workName, focusClub);
+      processedGroups++;
+      if (!baseOption) {
+        onProgress?.({
+          text: `${workName}: ${focusClub} の候補不足 (${processedGroups}/${focusClubs.length})`,
+          workName,
+          processedGroups,
+          totalGroups: focusClubs.length,
+          explored,
+          bestScore: options[0]?.score || 0,
+          bestOption: options[0] || null,
+        });
+        continue;
+      }
+
+      explored += baseOption.explored || 0;
+      const improved = improveDeckByExternalSwap(baseOption, cards, focusClub, rule, optionScan, workName);
+      explored += improved.explored || 0;
+
+      pushBestOption(options, improved.option || baseOption.option, maxKeep);
+      pushBestOption(options, baseOption.option, maxKeep);
+
+      onProgress?.({
+        text: `${workName}: ${focusClub} を探索中 (${processedGroups}/${focusClubs.length}) / 試行 ${formatNum(explored)} / 暫定 ${formatNum(options[0]?.score || 0)}`,
+        workName,
+        processedGroups,
+        totalGroups: focusClubs.length,
+        explored,
+        bestScore: options[0]?.score || 0,
+        bestOption: options[0] || null,
+      });
+    }
+
+    const seedOption = buildSeedDeckOption(seedDeck, cards, rule, workName);
+    if (seedOption) {
+      explored += 1;
+      pushBestOption(options, seedOption, maxKeep);
+    }
+
     const emptyOption = {
       workName,
       deck: [],
@@ -1204,341 +1247,199 @@
       exploredAt: 0,
     };
 
-    if (candidates.length === 0) {
-      const result = {
-        workName,
-        rule,
-        candidates,
-        options: [emptyOption],
-        explored: 0,
-      };
-      await saveSearchCache(cacheKey, cards, workName, result);
-      return result;
-    }
-
-    const progress = createSynergySearchProgress(workName, onProgress);
-    const exactResult = await enumerateTopDeckOptionsBySynergy(candidates, rule, analysis, optionScan, {
-      maxKeep,
-      workName,
-      onProgress: progress.report,
-    });
-    const swapSeedResult = enumerateTopDeckOptionsAroundCurrentDeck(cards, seedDeck, candidates, rule, analysis, optionScan, {
-      maxKeep,
-      workName,
-    });
-
-    const options = [emptyOption, ...exactResult.options, ...swapSeedResult.options]
-      .filter((option, index, arr) => arr.findIndex(x => x.key === option.key) === index)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, maxKeep);
-
-    if (!options.some(option => option.key === '')) {
-      options.push(emptyOption);
-    }
-
-    options.sort((a, b) => b.score - a.score);
     const result = {
       workName,
       rule,
-      candidates,
-      options,
-      explored: exactResult.explored + swapSeedResult.explored,
+      candidates: options.flatMap(option => option.deck || []),
+      options: [emptyOption, ...options]
+        .filter((option, index, arr) => arr.findIndex(x => x.key === option.key) === index)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, maxKeep),
+      explored,
     };
     await saveSearchCache(cacheKey, cards, workName, result);
     return result;
   }
 
-  async function enumerateTopDeckOptionsBySynergy(candidates, rule, analysis, optionScan, { maxKeep, workName, onProgress }) {
-    const bestOptions = [];
-    const ticker = createOptimizationTicker();
-    const seenDeckKeys = new Set();
-    let explored = 0;
-    let processedGroups = 0;
-    const anchorCards = buildAnchorCards(candidates, rule, analysis, optionScan);
-    const anchorPairs = buildAnchorPairs(anchorCards, rule, analysis, optionScan);
-    const generalCore = candidates.slice(0, CONFIG.synergyGeneralKeep);
+  function getFocusClubsForWork(cards, rule, optionScan) {
+    if (rule.clubs?.length) return [...new Set(rule.clubs)];
 
-    for (const anchor of anchorCards) {
-      await ticker.tick();
-      const pool = buildSynergyPool(anchor.deck, candidates, rule, analysis, optionScan, generalCore);
-      await enumerateDecksFromPool(anchor.deck, pool);
-      processedGroups++;
-      onProgress?.({
-        processedGroups,
-        totalGroups: anchorCards.length + anchorPairs.length,
-        explored,
-        bestScore: bestOptions[0]?.score || 0,
-        bestOption: bestOptions[0] || null,
-      });
-    }
-
-    for (const anchor of anchorPairs) {
-      await ticker.tick();
-      const pool = buildSynergyPool(anchor.deck, candidates, rule, analysis, optionScan, generalCore);
-      await enumerateDecksFromPool(anchor.deck, pool);
-      processedGroups++;
-      onProgress?.({
-        processedGroups,
-        totalGroups: anchorCards.length + anchorPairs.length,
-        explored,
-        bestScore: bestOptions[0]?.score || 0,
-        bestOption: bestOptions[0] || null,
-      });
-    }
-
-    return {
-      options: bestOptions.sort((a, b) => b.score - a.score),
-      explored,
-    };
-
-    async function enumerateDecksFromPool(anchorDeck, pool) {
-      const need = 5 - anchorDeck.length;
-      if (need < 0) return;
-      if (need === 0) {
-        pushDeckOption(anchorDeck);
-        return;
+    const scores = new Map();
+    for (const card of cards) {
+      const metrics = getOptionScanInfo(card, optionScan);
+      scores.set(card.club, (scores.get(card.club) || 0) + card.power + (metrics.ownPositive * 6));
+      for (const [club, total] of metrics.buffByClub.entries()) {
+        if (total <= 0) continue;
+        scores.set(club, (scores.get(club) || 0) + (total * 12) + ((metrics.slotByClub.get(club) || 0) * 800));
       }
-      if (pool.length < need) return;
-
-      const picked = [];
-      async function dfs(startIndex, left) {
-        await ticker.tick();
-        if (left === 0) {
-          pushDeckOption([...anchorDeck, ...picked]);
-          return;
-        }
-
-        const lastStart = pool.length - left;
-        for (let i = startIndex; i <= lastStart; i++) {
-          picked.push(pool[i]);
-          await dfs(i + 1, left - 1);
-          picked.pop();
-        }
-      }
-
-      await dfs(0, need);
     }
 
-    function pushDeckOption(deck) {
-      const key = deck.map(c => c.id).sort().join('|');
-      if (seenDeckKeys.has(key)) return;
-      seenDeckKeys.add(key);
-
-      explored++;
-      if (explored === 1 || explored % CONFIG.synergyProgressEveryDecks === 0) {
-        onProgress?.({
-          processedGroups,
-          totalGroups: anchorCards.length + anchorPairs.length,
-          explored,
-          bestScore: bestOptions[0]?.score || 0,
-          bestOption: bestOptions[0] || null,
-        });
-      }
-
-      const detail = evaluateDeck(deck, rule);
-      pushBestOption(bestOptions, {
-        workName,
-        deck: [...deck],
-        score: detail.total,
-        detail,
-        key,
-        exploredAt: explored,
-      }, maxKeep);
-    }
+    return [...scores.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, Math.max(6, CONFIG.candidateFocusClubCount))
+      .map(([club]) => club);
   }
 
-  function enumerateTopDeckOptionsAroundCurrentDeck(cards, currentDeck, candidates, rule, analysis, optionScan, { maxKeep, workName }) {
-    const baseDeck = restoreSeedDeck(currentDeck, cards);
-    if (!baseDeck.length) {
-      return { options: [], explored: 0 };
-    }
-
-    const bestOptions = [];
-    const seen = new Set();
-    let explored = 0;
-    const baseIds = new Set(baseDeck.map(card => card.id));
-    const replacementPool = [...new Map(
-      [...candidates, ...cards]
-        .filter(card => !baseIds.has(card.id))
-        .map(card => [card.id, card])
-    ).values()]
-      .map(card => ({
-        card,
-        score: estimateSynergyWithAnchor(card, baseDeck, rule, analysis, optionScan),
-      }))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, CONFIG.currentDeckSwapPoolKeep)
-      .map(item => item.card);
-
-    pushDeckOption(baseDeck);
-
-    for (let removeIndex = 0; removeIndex < baseDeck.length; removeIndex++) {
-      for (const replacement of replacementPool) {
-        const deck = baseDeck.filter((_, index) => index !== removeIndex);
-        deck.push(replacement);
-        if (new Set(deck.map(card => card.id)).size !== deck.length) continue;
-        pushDeckOption(deck);
-      }
-    }
-
-    const pairPool = replacementPool.slice(0, CONFIG.currentDeckPairSwapKeep);
-    for (let i = 0; i < baseDeck.length; i++) {
-      for (let j = i + 1; j < baseDeck.length; j++) {
-        for (let a = 0; a < pairPool.length; a++) {
-          for (let b = a + 1; b < pairPool.length; b++) {
-            const deck = baseDeck.filter((_, index) => index !== i && index !== j);
-            deck.push(pairPool[a], pairPool[b]);
-            if (new Set(deck.map(card => card.id)).size !== deck.length) continue;
-            pushDeckOption(deck);
-          }
-        }
-      }
-    }
-
-    return {
-      options: bestOptions.sort((a, b) => b.score - a.score),
-      explored,
-    };
-
-    function pushDeckOption(deck) {
-      if (deck.length !== 5) return;
-      const key = deck.map(card => card.id).sort().join('|');
-      if (seen.has(key)) return;
-      seen.add(key);
-      explored++;
-
-      const detail = evaluateDeck(deck, rule);
-      pushBestOption(bestOptions, {
-        workName,
-        deck: [...deck],
-        score: detail.total,
-        detail,
-        key,
-        exploredAt: explored,
-      }, maxKeep);
-    }
+  function buildFocusedPool(cards, focusClub, rule, optionScan) {
+    return [...cards]
+      .filter(card => isCardRelevantToFocus(card, focusClub, rule))
+      .sort((a, b) => estimateCardForFocus(b, focusClub, rule, optionScan) - estimateCardForFocus(a, focusClub, rule, optionScan))
+      .slice(0, Math.max(14, CONFIG.candidateOverallKeep / 10));
   }
 
-  function restoreSeedDeck(seedDeck, cards) {
-    if (!seedDeck?.length) return [];
-    return restoreDeckRefs(serializeDeckRefs(seedDeck, seedDeck), cards);
+  function isCardRelevantToFocus(card, focusClub, rule) {
+    if (card.club === focusClub) return true;
+    if (card.effects.some(eff => eff.value > 0 && eff.club === focusClub)) return true;
+    if (rule.type === 'rarityMultiplier' && rule.rarities?.includes(card.rarity)) return true;
+    if (rule.type === 'minPower' && card.power < rule.minPower) return true;
+    return false;
   }
 
-  function buildAnchorCards(candidates, rule, analysis, optionScan = null) {
-    return candidates
-      .map(card => ({
-        deck: [card],
-        score: estimateAnchorStrength(card, rule, analysis, optionScan),
-      }))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, Math.min(CONFIG.synergyAnchorKeep, candidates.length));
-  }
-
-  function buildAnchorPairs(anchorCards, rule, analysis, optionScan = null) {
-    const pairSource = anchorCards.slice(0, Math.min(CONFIG.synergyPairAnchorKeep, anchorCards.length));
-    const pairs = [];
-
-    for (let i = 0; i < pairSource.length; i++) {
-      for (let j = i + 1; j < pairSource.length; j++) {
-        const first = pairSource[i].deck[0];
-        const second = pairSource[j].deck[0];
-        pairs.push({
-          deck: [first, second],
-          score: estimatePairAnchorStrength(first, second, rule, analysis, optionScan),
-        });
-      }
-    }
-
-    return pairs
-      .sort((a, b) => b.score - a.score)
-      .slice(0, CONFIG.synergyPairAnchorKeep);
-  }
-
-  function buildSynergyPool(anchorDeck, candidates, rule, analysis, optionScan, generalCore) {
-    const anchorIds = new Set(anchorDeck.map(card => card.id));
-    const pool = [];
-    const seen = new Set(anchorIds);
-
-    const pushCard = (card) => {
-      if (!card || seen.has(card.id)) return;
-      seen.add(card.id);
-      pool.push(card);
-    };
-
-    const anchorClubs = new Set(anchorDeck.map(card => card.club));
-    const boostedClubs = new Set();
-    for (const card of anchorDeck) {
-      for (const eff of card.effects) {
-        if (eff.value > 0) boostedClubs.add(eff.club);
-      }
-    }
-
-    const ranked = candidates
-      .filter(card => !anchorIds.has(card.id))
-      .map(card => ({
-        card,
-        score: estimateSynergyWithAnchor(card, anchorDeck, rule, analysis, optionScan),
-      }))
-      .sort((a, b) => b.score - a.score);
-
-    ranked.slice(0, CONFIG.synergyPoolKeep).forEach(item => pushCard(item.card));
-
-    candidates
-      .filter(card => !anchorIds.has(card.id) && (anchorClubs.has(card.club) || boostedClubs.has(card.club)))
-      .slice(0, CONFIG.synergyPoolKeep)
-      .forEach(pushCard);
-
-    generalCore.forEach(pushCard);
-
-    return pool.slice(0, Math.max(CONFIG.synergyPoolKeep, 10));
-  }
-
-  function estimateAnchorStrength(card, rule, analysis = null, optionScan = null) {
-    const info = analysis?.byId?.get(card.id);
+  function estimateCardForFocus(card, focusClub, rule, optionScan) {
     const metrics = getOptionScanInfo(card, optionScan);
-    const positiveTotal = info?.positiveTotal ?? metrics.positiveTotal;
-    const positiveSlots = info?.positiveSlots ?? metrics.maxBuffSlots;
-    const ownPositive = info?.ownPositive ?? metrics.ownPositive;
-    const targetPositive = info?.targetPositive ?? getTargetOptionMetrics(metrics, rule).targetPositive;
-    return estimateCardValue(card, rule, analysis, optionScan) + positiveTotal * 4 + targetPositive * 10 + positiveSlots * 900 + ownPositive * 4;
-  }
+    const focusPositive = metrics.buffByClub.get(focusClub) || 0;
+    const focusSlots = metrics.slotByClub.get(focusClub) || 0;
+    let score = focusPositive * 28 + focusSlots * 2200 + metrics.positiveTotal * 4;
 
-  function estimatePairAnchorStrength(cardA, cardB, rule, analysis = null, optionScan = null) {
-    const base = estimateAnchorStrength(cardA, rule, analysis, optionScan) + estimateAnchorStrength(cardB, rule, analysis, optionScan);
-    const synergy = estimateSynergyWithAnchor(cardA, [cardB], rule, analysis, optionScan) + estimateSynergyWithAnchor(cardB, [cardA], rule, analysis, optionScan);
-    return base + synergy;
-  }
-
-  function estimateSynergyWithAnchor(card, anchorDeck, rule, analysis = null, optionScan = null) {
-    let score = estimateCardValue(card, rule, analysis, optionScan);
-    const targetClubs = new Set(rule.clubs || []);
-
-    for (const anchor of anchorDeck) {
-      for (const eff of anchor.effects) {
-        if (eff.value <= 0) continue;
-        if (eff.club === card.club) score += eff.value * 12;
-        if (targetClubs.has(eff.club)) score += eff.value * 8;
-      }
-
-      for (const eff of card.effects) {
-        if (eff.value <= 0) continue;
-        if (eff.club === anchor.club) score += eff.value * 9;
-        if (targetClubs.has(eff.club)) score += eff.value * 12;
-      }
-
-      if (anchor.club === card.club) {
-        score += applyWorkBase(card, rule) * 0.3;
-      }
+    if (card.club === focusClub) {
+      score += applyWorkBase(card, rule) * 1.45;
+      score += metrics.ownPositive * 10;
+    } else {
+      score += applyWorkBase(card, rule) * 0.45;
     }
 
-    if (rule.type === 'minPower' && card.power < rule.minPower) {
-      score += (rule.minPower - card.power) * 4;
-    }
     if (rule.type === 'rarityMultiplier' && rule.rarities?.includes(card.rarity)) {
-      score += applyWorkBase(card, rule) * 0.35;
+      score += applyWorkBase(card, rule) * 0.9;
+    }
+    if (rule.type === 'minPower' && card.power < rule.minPower) {
+      score += (rule.minPower - card.power) * 4.5;
+    }
+    if (rule.type === 'onlyClub' && card.club !== focusClub) {
+      score -= 4000;
     }
 
     return score;
+  }
+
+  function findBestDeckFromFocusedPool(pool, rule, workName, focusClub) {
+    if (pool.length < 5) return null;
+
+    let bestOption = null;
+    let explored = 0;
+    const chosen = [];
+    const lastStart = pool.length - 5;
+
+    function dfs(startIndex, left) {
+      if (left === 0) {
+        explored++;
+        const deck = [...chosen];
+        const detail = evaluateDeck(deck, rule);
+        const option = {
+          workName,
+          deck,
+          score: detail.total,
+          detail,
+          key: buildDeckKey(deck),
+          exploredAt: explored,
+          focusClub,
+        };
+        if (!bestOption || option.score > bestOption.score) {
+          bestOption = option;
+        }
+        return;
+      }
+
+      const limit = pool.length - left;
+      for (let i = startIndex; i <= limit; i++) {
+        chosen.push(pool[i]);
+        dfs(i + 1, left - 1);
+        chosen.pop();
+      }
+    }
+
+    dfs(0, 5);
+    return bestOption ? { option: bestOption, explored } : null;
+  }
+
+  function improveDeckByExternalSwap(baseResult, cards, focusClub, rule, optionScan, workName) {
+    if (!baseResult?.option?.deck?.length) {
+      return { option: null, explored: 0 };
+    }
+
+    let bestOption = baseResult.option;
+    let explored = 0;
+    const seen = new Set([bestOption.key]);
+    let improved = true;
+
+    while (improved) {
+      improved = false;
+      const weakCards = rankWeakCards(bestOption.deck, rule)
+        .slice(0, 3)
+        .map(item => item.index);
+      const deckIds = new Set(bestOption.deck.map(card => card.id));
+      const outsideCards = [...cards]
+        .filter(card => !deckIds.has(card.id) && isCardRelevantToFocus(card, focusClub, rule))
+        .sort((a, b) => estimateCardForFocus(b, focusClub, rule, optionScan) - estimateCardForFocus(a, focusClub, rule, optionScan))
+        .slice(0, Math.max(10, CONFIG.currentDeckSwapPoolKeep));
+
+      for (const index of weakCards) {
+        for (const candidate of outsideCards) {
+          const nextDeck = bestOption.deck.map((card, deckIndex) => deckIndex === index ? candidate : card);
+          if (new Set(nextDeck.map(card => card.id)).size !== nextDeck.length) continue;
+
+          const key = buildDeckKey(nextDeck);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          explored++;
+
+          const detail = evaluateDeck(nextDeck, rule);
+          if (detail.total > bestOption.score) {
+            bestOption = {
+              workName,
+              deck: nextDeck,
+              score: detail.total,
+              detail,
+              key,
+              exploredAt: explored,
+              focusClub,
+            };
+            improved = true;
+            break;
+          }
+        }
+        if (improved) break;
+      }
+    }
+
+    return { option: bestOption, explored };
+  }
+
+  function rankWeakCards(deck, rule) {
+    const currentScore = evaluateDeck(deck, rule).total;
+    return deck.map((card, index) => {
+      const nextDeck = deck.filter((_, deckIndex) => deckIndex !== index);
+      const reducedScore = nextDeck.length ? evaluateDeck(nextDeck, rule).total : 0;
+      const contribution = currentScore - reducedScore;
+      return { card, index, contribution };
+    }).sort((a, b) => a.contribution - b.contribution);
+  }
+
+  function buildSeedDeckOption(seedDeck, cards, rule, workName) {
+    const restored = restoreDeckRefs(serializeDeckRefs(seedDeck || [], seedDeck || []), cards);
+    if (restored.length !== 5) return null;
+    const detail = evaluateDeck(restored, rule);
+    return {
+      workName,
+      deck: restored,
+      score: detail.total,
+      detail,
+      key: buildDeckKey(restored),
+      exploredAt: 0,
+    };
+  }
+
+  function buildDeckKey(deck) {
+    return deck.map(card => card.id).sort().join('|');
   }
 
   function getPositiveBuffStats(card) {
@@ -1646,46 +1547,81 @@
   async function findGlobalBestAllocation(cards, works, onProgress = null) {
     const unlockedWorks = getOrderedUnlockedWorks(works);
     const currentDeckByWork = Object.fromEntries(unlockedWorks.map(workName => [workName, getCardsCurrentlyInWork(workName)]));
-    const byWork = Object.fromEntries(unlockedWorks.map(workName => [workName, {
-      workName,
-      deck: [],
-      score: 0,
-      detail: { total: 0, byCard: {} },
-      key: '',
-      exploredAt: 0,
-    }]));
     const searchedByWork = [];
-    let totalScore = 0;
-    let nodes = 0;
-    let remainingCards = [...cards];
 
     for (let index = 0; index < unlockedWorks.length; index++) {
       const workName = unlockedWorks[index];
-      onProgress?.(`全体割当探索: ${workName} を探索中 (${index + 1}/${unlockedWorks.length})`);
-      const searched = await searchTopDeckOptions(remainingCards, workName, CONFIG.topDeckOptionsPerWork, (message) => {
-        onProgress?.(message);
+      onProgress?.(`全ワーク候補作成: ${workName} (${index + 1}/${unlockedWorks.length})`);
+      const searched = await searchTopDeckOptions(cards, workName, CONFIG.topDeckOptionsPerWork, (progress) => {
+        onProgress?.(progress);
       }, {
         seedDeck: currentDeckByWork[workName] || [],
       });
-      searchedByWork.push(searched);
-
-      const selected = findBestNonEmptyOption(searched.options);
-      if (!selected) {
+      searched.options = (searched.options || []).filter(option => option.deck?.length);
+      if (!searched.options.length) {
         throw new Error(`${workName} に割り当てられる非空デッキが見つかりませんでした`);
       }
+      searchedByWork.push(searched);
+    }
 
-      byWork[workName] = selected;
-      totalScore += selected.score || 0;
-      nodes += searched.explored || 0;
-      remainingCards = removeSelectedCards(remainingCards, selected.deck);
+    searchedByWork.sort((a, b) => {
+      const maxA = a.options[0]?.score || 0;
+      const maxB = b.options[0]?.score || 0;
+      return maxB - maxA;
+    });
+
+    let bestPlan = null;
+    let nodes = 0;
+    const suffixMax = new Array(searchedByWork.length + 1).fill(0);
+    for (let i = searchedByWork.length - 1; i >= 0; i--) {
+      suffixMax[i] = suffixMax[i + 1] + (searchedByWork[i].options[0]?.score || 0);
+    }
+
+    const usedIds = new Set();
+    const picked = [];
+    dfs(0, 0);
+
+    if (!bestPlan) {
+      throw new Error('全ワークで重複なしの組み合わせが見つかりませんでした');
     }
 
     return {
-      totalScore,
-      byWork,
+      totalScore: bestPlan.totalScore,
+      byWork: bestPlan.byWork,
       nodes,
       searchedByWork,
     };
+
+    function dfs(depth, score) {
+      nodes++;
+      if (score + suffixMax[depth] <= (bestPlan?.totalScore || -Infinity)) return;
+      if (depth === searchedByWork.length) {
+        const byWork = {};
+        for (const option of picked) byWork[option.workName] = option;
+        bestPlan = {
+          totalScore: score,
+          byWork,
+        };
+        return;
+      }
+
+      const searched = searchedByWork[depth];
+      for (const option of searched.options) {
+        if (option.deck.some(card => usedIds.has(card.id))) continue;
+        for (const card of option.deck) usedIds.add(card.id);
+        picked.push(option);
+        onProgress?.({
+          text: `全ワーク組み合わせ探索: ${searched.workName} を割当中 / 暫定 ${formatNum(Math.max(score + option.score, bestPlan?.totalScore || 0))}`,
+          workName: searched.workName,
+          bestScore: bestPlan?.totalScore || 0,
+          bestOption: option,
+          explored: nodes,
+        });
+        dfs(depth + 1, score + option.score);
+        picked.pop();
+        for (const card of option.deck) usedIds.delete(card.id);
+      }
+    }
   }
 
   function getOrderedUnlockedWorks(works) {
@@ -2725,10 +2661,6 @@
         prefilterPerClubKeep: CONFIG.prefilterPerClubKeep,
         candidateOverallKeep: CONFIG.candidateOverallKeep,
         candidatePerClubKeep: CONFIG.candidatePerClubKeep,
-        synergyAnchorKeep: CONFIG.synergyAnchorKeep,
-        synergyPairAnchorKeep: CONFIG.synergyPairAnchorKeep,
-        synergyPoolKeep: CONFIG.synergyPoolKeep,
-        synergyGeneralKeep: CONFIG.synergyGeneralKeep,
         currentDeckSwapPoolKeep: CONFIG.currentDeckSwapPoolKeep,
         currentDeckPairSwapKeep: CONFIG.currentDeckPairSwapKeep,
       },
