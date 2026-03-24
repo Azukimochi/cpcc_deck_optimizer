@@ -106,8 +106,14 @@
       style.id = 'cpcc-optimizer-style';
       style.textContent = `
         #cpcc-optimizer-root{
-          position:fixed;right:16px;bottom:16px;z-index:999999;
-          width:400px;max-height:80vh;overflow:auto;
+          position:fixed;
+          right:16px;
+          top:16px;
+          bottom:auto;
+          z-index:999999;
+          width:400px;
+          max-height:80vh;
+          overflow:auto;
           background:rgba(16,24,39,.95);color:#fff;
           border-radius:12px;padding:12px;box-shadow:0 12px 40px rgba(0,0,0,.35);
           font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
