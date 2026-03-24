@@ -914,7 +914,8 @@
   }
 
   function buildCandidates(cards, rule, analysis = null) {
-    const ranked = [...cards].sort((a, b) => estimateCardValue(b, rule, analysis) - estimateCardValue(a, rule, analysis));
+    const sourceCards = getRuleRelevantCards(cards, rule);
+    const ranked = [...sourceCards].sort((a, b) => estimateCardValue(b, rule, analysis) - estimateCardValue(a, rule, analysis));
     const picked = [];
     const seen = new Set();
 
@@ -944,6 +945,19 @@
     }
 
     return picked;
+  }
+
+  function getRuleRelevantCards(cards, rule) {
+    if (!rule?.clubs?.length) return cards;
+
+    const targetClubs = new Set(rule.clubs);
+    const relevant = cards.filter(card => {
+      if (targetClubs.has(card.club)) return true;
+      return card.effects.some(eff => eff.value > 0 && targetClubs.has(eff.club));
+    });
+
+    // 候補を絞りすぎると探索漏れになるので、少なすぎる場合は元に戻す
+    return relevant.length >= Math.min(40, cards.length) ? relevant : cards;
   }
 
   function getCandidateFocusClubs(rankedCards, rule, analysis = null) {
