@@ -89,6 +89,7 @@
 
   function boot() {
     if (document.getElementById('cpcc-optimizer-root')) return;
+    ensureLauncherButton();
     createPanel();
     reloadAll();
   }
@@ -122,11 +123,28 @@
       <div id="cpcc-result"></div>
     `;
     document.body.appendChild(root);
+    updateLauncherVisibility(false);
 
     if (!document.getElementById('cpcc-optimizer-style')) {
       const style = document.createElement('style');
       style.id = 'cpcc-optimizer-style';
       style.textContent = `
+        #cpcc-optimizer-launcher{
+          position:fixed;
+          right:16px;
+          top:16px;
+          z-index:999998;
+          border:none;
+          border-radius:999px;
+          padding:10px 14px;
+          cursor:pointer;
+          background:#2563eb;
+          color:#fff;
+          font-size:12px;
+          font-weight:700;
+          box-shadow:0 12px 30px rgba(0,0,0,.28);
+        }
+        #cpcc-optimizer-launcher:hover{filter:brightness(1.08)}
         #cpcc-optimizer-root{
           position:fixed;
           right:16px;
@@ -211,11 +229,44 @@
 
     root.querySelector('#cpcc-reload').addEventListener('click', reloadAll);
     root.querySelector('#cpcc-run-all').addEventListener('click', runGlobalOptimization);
-    root.querySelector('#cpcc-close').addEventListener('click', () => root.remove());
+    root.querySelector('#cpcc-close').addEventListener('click', () => hidePanel());
 
     root.querySelectorAll('[data-work]').forEach(btn => {
       btn.addEventListener('click', () => runSingleWork(btn.dataset.work));
     });
+  }
+
+  function ensureLauncherButton() {
+    if (document.getElementById('cpcc-optimizer-launcher')) return;
+    const btn = document.createElement('button');
+    btn.id = 'cpcc-optimizer-launcher';
+    btn.textContent = 'Optimizerを開く';
+    btn.style.display = 'none';
+    btn.addEventListener('click', showPanel);
+    document.body.appendChild(btn);
+  }
+
+  function hidePanel() {
+    const root = document.getElementById('cpcc-optimizer-root');
+    if (!root) return;
+    root.style.display = 'none';
+    updateLauncherVisibility(true);
+  }
+
+  function showPanel() {
+    const root = document.getElementById('cpcc-optimizer-root');
+    if (!root) {
+      boot();
+      return;
+    }
+    root.style.display = '';
+    updateLauncherVisibility(false);
+  }
+
+  function updateLauncherVisibility(show) {
+    const btn = document.getElementById('cpcc-optimizer-launcher');
+    if (!btn) return;
+    btn.style.display = show ? '' : 'none';
   }
 
   function setStatus(text) {
@@ -1572,10 +1623,20 @@
     setStatus('全プラン自動セットを開始します...');
 
     const targetWorks = getOrderedUnlockedWorks(state.works);
+    const removalPlan = [];
 
     for (const workName of targetWorks) {
-      if (!byWork[workName]) continue;
-      await clearWorkDeck(workName);
+      const item = byWork[workName];
+      if (!item) continue;
+      const currentEntries = getCurrentWorkCardEntries(workName);
+      const diff = diffWorkDeck(currentEntries, item.deck || []);
+      if (diff.toRemove.length) {
+        removalPlan.push({ workName, entries: diff.toRemove });
+      }
+    }
+
+    for (const step of removalPlan) {
+      await removeWorkEntries(step.workName, step.entries);
     }
 
     reloadAll();
@@ -1583,7 +1644,7 @@
     for (const workName of targetWorks) {
       const item = byWork[workName];
       if (!item) continue;
-      await autoSetWorkDeck(workName, item.deck);
+      await autoSetWorkDeck(workName, item.deck, { skipRemoval: true });
     }
 
     setStatus('全プランの自動セットが完了しました');
@@ -1599,29 +1660,17 @@
     const targetDeck = deck || [];
     const currentEntries = getCurrentWorkCardEntries(workName);
     const diff = diffWorkDeck(currentEntries, targetDeck);
+    const entriesToRemove = opts.skipRemoval ? [] : diff.toRemove;
 
-    if (!diff.toRemove.length && !diff.toAdd.length) {
+    if (!entriesToRemove.length && !diff.toAdd.length) {
       setStatus(`${workName}: 差分がないため再セットを省略しました`);
       return;
     }
 
-    setStatus(`${workName}: ${diff.toRemove.length} 枚解除 / ${diff.toAdd.length} 枚設定します`);
+    setStatus(`${workName}: ${entriesToRemove.length} 枚解除 / ${diff.toAdd.length} 枚設定します`);
     await activateWorkBase(workName);
 
-    for (const entry of diff.toRemove) {
-      await activateWorkBase(workName);
-      const rootNow = findWorkRoot(workName);
-      const countBefore = rootNow ? parseCurrentCount(rootNow) : 0;
-      if (countBefore <= 0) break;
-
-      simulateClick(entry.root);
-      highlightElement(entry.root, 'orange');
-      await sleep(CONFIG.autoStepDelay);
-      const changed = await waitForWorkCountLessThan(workName, countBefore, 4000);
-      if (!changed) {
-        await sleep(CONFIG.autoClickDelayLong);
-      }
-    }
+    await removeWorkEntries(workName, entriesToRemove);
 
     for (const card of diff.toAdd) {
       const currentRoot = findWorkRoot(workName);
@@ -1655,6 +1704,24 @@
     }
 
     setStatus(`${workName}: 自動セット完了`);
+  }
+
+  async function removeWorkEntries(workName, entries) {
+    for (const entry of entries) {
+      await activateWorkBase(workName);
+      const rootNow = findWorkRoot(workName);
+      const countBefore = rootNow ? parseCurrentCount(rootNow) : 0;
+      if (countBefore <= 0) break;
+      if (!entry.root?.isConnected) continue;
+
+      simulateClick(entry.root);
+      highlightElement(entry.root, 'orange');
+      await sleep(CONFIG.autoStepDelay);
+      const changed = await waitForWorkCountLessThan(workName, countBefore, 4000);
+      if (!changed) {
+        await sleep(CONFIG.autoClickDelayLong);
+      }
+    }
   }
 
   function highlightElement(el, color = 'red') {
