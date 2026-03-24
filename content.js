@@ -354,16 +354,14 @@
       el.onclick = () => {
         const cardId = el.dataset.cpccCardId;
         const cardName = el.dataset.cpccCardName;
-        const occurrence = Number(el.dataset.cpccCardOccurrence || '1');
-
-        const card = state.cards.find(c => c.id === cardId) || state.cards.find(c => c.name === cardName);
-        const target = findOwnedCardRootByOccurrence(card || {
-          id: cardId,
-          name: cardName,
-          power: Number(el.dataset.cpccCardPower || '0'),
-          club: el.dataset.cpccCardClub || '',
-          rarity: el.dataset.cpccCardRarity || '',
-        }, occurrence);
+        const cardSignature = el.dataset.cpccCardSig || '';
+        const card = state.cards.find(c => c.id === cardId)
+          || findCardBySignature(cardSignature);
+        if (!card) {
+          setStatus(`カード位置が見つかりません: ${cardName}`);
+          return;
+        }
+        const target = findCardRootForJump(card);
         if (!target) return;
 
         jumpToOwnedCardRoot(target, cardName, el);
@@ -372,7 +370,7 @@
   }
 
   function jumpToOwnedCard(card, resultEl = null) {
-    const target = findOwnedCardRootForSelection(card);
+    const target = findCardRootForJump(card);
     if (!target) {
       setStatus(`カード位置が見つかりません: ${card.name}`);
       return;
@@ -637,8 +635,35 @@
     return parseEffects(text);
   }
 
+  function getEffectsSignature(effects) {
+    return [...(effects || [])]
+      .map(eff => `${eff.club}:${eff.value}`)
+      .sort()
+      .join('|');
+  }
+
   function getCardSignatureKey(card) {
-    return [card.name, card.power, card.club, card.rarity].join('__');
+    return [card.name, card.power, card.club, card.rarity, getEffectsSignature(card.effects)].join('__');
+  }
+
+  function getCardRootSignatureKey(root) {
+    const parsed = parseCardFromRoot(root, 'sig');
+    return parsed ? getCardSignatureKey(parsed) : null;
+  }
+
+  function findCardBySignature(signature) {
+    if (!signature) return null;
+
+    const ownedCard = state.cards.find(card => getCardSignatureKey(card) === signature);
+    if (ownedCard) return ownedCard;
+
+    for (const workName of WORK_ORDER) {
+      const workCard = getCardsCurrentlyInWork(workName)
+        .find(card => getCardSignatureKey(card) === signature);
+      if (workCard) return workCard;
+    }
+
+    return null;
   }
 
   function getCardsCurrentlyInWork(workName) {
@@ -665,10 +690,8 @@
       if (!root) continue;
 
       for (const cardRoot of findFilledWorkCardRoots(root)) {
-        const info = parseCardSignature(cardRoot);
-        if (!info?.name || info.power == null || !info.club) continue;
-
-        const key = getCardSignatureKey(info);
+        const key = getCardRootSignatureKey(cardRoot);
+        if (!key) continue;
         counts.set(key, (counts.get(key) || 0) + 1);
       }
     }
@@ -1706,13 +1729,8 @@
       return `<div class="cpcc-card"><span class="cpcc-muted">カードなし</span></div>`;
     }
 
-    const seenKeys = new Map();
-
     return deck.map(c => {
       const d = detail?.byCard?.[c.id] || { bonusPercent: 0, basePower: c.power, bonusPower: 0, afterClubBonus: c.power, fieldPower: 0, finalPower: c.power, fieldLabel: 'なし' };
-      const key = getCardSignatureKey(c);
-      const occurrence = (seenKeys.get(key) || 0) + 1;
-      seenKeys.set(key, occurrence);
       const bonusPowerText = d.bonusPower > 0 ? `(+${formatNum(d.bonusPower)})` : (d.bonusPower < 0 ? `(${formatNum(d.bonusPower)})` : '(0)');
       const fieldPowerText = d.fieldPower > 0 ? `(+${formatNum(d.fieldPower)})` : (d.fieldPower < 0 ? `(${formatNum(d.fieldPower)})` : '(0)');
 
@@ -1720,11 +1738,11 @@
       <div
         class="cpcc-card cpcc-result-card"
         data-cpcc-card-id="${escapeHtml(c.id)}"
+        data-cpcc-card-sig="${escapeHtml(getCardSignatureKey(c))}"
         data-cpcc-card-name="${escapeHtml(c.name)}"
         data-cpcc-card-power="${escapeHtml(String(c.power))}"
         data-cpcc-card-club="${escapeHtml(c.club)}"
         data-cpcc-card-rarity="${escapeHtml(c.rarity)}"
-        data-cpcc-card-occurrence="${occurrence}"
         title="クリックでカード位置へスクロール"
       >
         <div class="cpcc-title">${escapeHtml(c.name)} <span class="cpcc-sub">[${escapeHtml(c.rarity)}]</span></div>
@@ -2053,9 +2071,14 @@
     return findOwnedCardRootForSelectionEx(card);
   }
 
+  function findCardRootForJump(card) {
+    return findCardRootForHighlight(card);
+  }
+
   function findCardRootForHighlight(card, opts = {}) {
     const excludeRoots = opts.excludeRoots || new Set();
     const preferredWorkName = opts.preferredWorkName || '';
+    const targetSignature = getCardSignatureKey(card);
     const searchRoots = [];
     const pushRoots = (roots) => {
       for (const root of roots) {
@@ -2077,37 +2100,13 @@
 
     pushRoots(findOwnedCardRoots());
 
-    let exact = searchRoots.find(root => isMatchingCardRoot(root, card));
-    if (exact) return exact;
-
-    exact = searchRoots.find(root => {
-      const parsed = parseCardSignature(root);
-      return parsed && parsed.name === card.name && parsed.power === card.power;
-    });
-    if (exact) return exact;
-
-    return searchRoots.find(root => {
-      const parsed = parseCardSignature(root);
-      return parsed && parsed.name === card.name;
-    }) || null;
-  }
-
-  function findOwnedCardRootByOccurrence(card, occurrence = 1) {
-    const roots = findOwnedCardRoots().filter(root => {
-      const parsed = parseCardSignature(root);
-      return parsed &&
-        parsed.name === card.name &&
-        parsed.power === card.power &&
-        parsed.club === card.club &&
-        parsed.rarity === card.rarity;
-    });
-
-    return roots[Math.max(0, occurrence - 1)] || roots[0] || null;
+    return searchRoots.find(root => getCardRootSignatureKey(root) === targetSignature) || null;
   }
 
   function findOwnedCardRootForSelectionEx(card, opts = {}) {
     const excludeRoots = opts.excludeRoots || new Set();
     const excludeInDeck = !!opts.excludeInDeck;
+    const targetSignature = getCardSignatureKey(card);
     const rememberedRoots = [
       card?.root,
       state.cards.find(c => c.id === card.id)?.root,
@@ -2116,7 +2115,7 @@
     for (const root of rememberedRoots) {
       if (excludeRoots.has(root)) continue;
       if (excludeInDeck && root.classList.contains('in-deck')) continue;
-      if (isMatchingCardRoot(root, card)) return root;
+      if (getCardRootSignatureKey(root) === targetSignature) return root;
     }
 
     const roots = findOwnedCardRoots().filter(root => {
@@ -2125,40 +2124,12 @@
       return true;
     });
 
-    // まずは厳密一致
-    let exact = roots.find(root => {
-      const parsed = parseCardSignature(root);
-      return parsed &&
-        parsed.name === card.name &&
-        parsed.power === card.power &&
-        parsed.club === card.club &&
-        parsed.rarity === card.rarity;
-    });
-    if (exact) return exact;
-
-    // 名前 + Power
-    exact = roots.find(root => {
-      const parsed = parseCardSignature(root);
-      return parsed && parsed.name === card.name && parsed.power === card.power;
-    });
-    if (exact) return exact;
-
-    // 名前だけ
-    return roots.find(root => {
-      const parsed = parseCardSignature(root);
-      return parsed && parsed.name === card.name;
-    }) || null;
+    return roots.find(root => getCardRootSignatureKey(root) === targetSignature) || null;
   }
 
   function isMatchingCardRoot(root, card) {
     if (!root?.isConnected) return false;
-    const parsed = parseCardSignature(root);
-    if (!parsed) return false;
-
-    return parsed.name === card.name &&
-      parsed.power === card.power &&
-      parsed.club === card.club &&
-      parsed.rarity === card.rarity;
+    return getCardRootSignatureKey(root) === getCardSignatureKey(card);
   }
 
   function parseCardSignature(root) {
@@ -2492,9 +2463,8 @@
     const pushRoot = (root) => {
       if (!root || seenRoots.has(root)) return;
       seenRoots.add(root);
-      const info = parseCardSignature(root);
-      if (!info?.name || info.power == null || !info.club) return;
-      const sig = getCardSignatureKey(info);
+      const sig = getCardRootSignatureKey(root);
+      if (!sig) return;
       counts.set(sig, (counts.get(sig) || 0) + 1);
     };
 
