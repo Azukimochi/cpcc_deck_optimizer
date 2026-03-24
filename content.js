@@ -140,6 +140,29 @@
         .cpcc-hr{height:1px;background:rgba(255,255,255,.12);margin:8px 0}
         .cpcc-warn{color:#fbbf24}
         .cpcc-ok{color:#86efac}
+        
+        .cpcc-highlight-card{
+          outline: 4px solid #22c55e !important;
+          outline-offset: -2px !important;
+          box-shadow: 0 0 0 4px rgba(34,197,94,.25), 0 0 24px rgba(34,197,94,.45) !important;
+          position: relative;
+          z-index: 2;
+        }
+
+        .cpcc-highlight-card[data-cpcc-work]::after{
+          content: attr(data-cpcc-work);
+          position: absolute;
+          left: 6px;
+          top: 6px;
+          background: rgba(34,197,94,.95);
+          color: #fff;
+          font-size: 11px;
+          font-weight: 700;
+          padding: 2px 6px;
+          border-radius: 999px;
+          pointer-events: none;
+          z-index: 3;
+        }
       `;
       document.head.appendChild(style);
     }
@@ -165,25 +188,36 @@
   }
 
   function bindResultButtons() {
-    document.querySelectorAll('[data-cpcc-action="set-work"]').forEach(btn => {
-      btn.onclick = async () => {
+    document.querySelectorAll('[data-cpcc-action="highlight-work"]').forEach(btn => {
+      btn.onclick = () => {
         const workName = btn.dataset.work;
         const plan = state.globalPlan?.byWork?.[workName] || state.singleResults?.[workName];
-        if (!plan?.deck) {
-          alert('セット対象のデッキがありません');
+        if (!plan?.deck?.length) {
+          alert('ハイライト対象のデッキがありません');
           return;
         }
-        await autoSetWorkDeck(workName, plan.deck);
+
+        clearAllHighlights();
+        highlightDeck(plan.deck, workName);
+        setStatus(`${workName}: ${plan.deck.length} 枚をハイライトしました`);
       };
     });
 
-    document.querySelectorAll('[data-cpcc-action="set-global"]').forEach(btn => {
-      btn.onclick = async () => {
+    document.querySelectorAll('[data-cpcc-action="highlight-global"]').forEach(btn => {
+      btn.onclick = () => {
         if (!state.globalPlan?.byWork) {
           alert('先に全ワーク最適化を実行してください');
           return;
         }
-        await autoSetGlobalPlan(state.globalPlan.byWork);
+
+        clearAllHighlights();
+
+        for (const [workName, plan] of Object.entries(state.globalPlan.byWork)) {
+          if (!plan?.deck?.length) continue;
+          highlightDeck(plan.deck, workName);
+        }
+
+        setStatus('全プランのカードをハイライトしました');
       };
     });
   }
@@ -739,7 +773,7 @@
         <div class="cpcc-score">推定合計Power: ${formatNum(res.score)}</div>
         <div class="cpcc-sub">候補数: ${res.candidateCount} / 探索数: ${formatNum(res.explored)}</div>
         <div class="cpcc-btns">
-          <button class="green" data-cpcc-action="set-work" data-work="${escapeHtml(workName)}">このデッキをセット</button>
+          <button class="green" data-cpcc-action="highlight-work" data-work="${escapeHtml(workName)}">このデッキをハイライト</button>
         </div>
       </div>
       ${renderDeckCards(res.deck, res.detail)}
@@ -762,7 +796,7 @@
           <div class="cpcc-title">${escapeHtml(workName)}</div>
           <div class="cpcc-score">推定Power: ${formatNum(item.score || 0)}</div>
           <div class="cpcc-btns">
-            <button class="green" data-cpcc-action="set-work" data-work="${escapeHtml(workName)}">このワークにセット</button>
+            <button class="green" data-cpcc-action="highlight-global">全プランをハイライト</button>
           </div>
         </div>
         ${renderDeckCards(item.deck || [], item.detail || { byCard: {} })}
@@ -851,29 +885,49 @@
       const slot = findNextEmptySlot(work.root);
       if (!slot) {
         console.warn('[CPCC] empty slot not found', workName);
+        setStatus(`${workName}: 空きスロットが見つかりません`);
         break;
       }
 
+      console.log('[CPCC] click slot', workName, card.name, slot);
       simulateClick(slot);
-      await sleep(CONFIG.autoClickDelayLong);
+      await sleep(500);
 
       const cardRoot = findOwnedCardRootForSelection(card);
       if (!cardRoot) {
         console.warn('[CPCC] owned card root not found', card);
+        setStatus(`${workName}: カードが見つかりません ${card.name}`);
         continue;
       }
 
       const target = findClickableCardTarget(cardRoot);
       if (!target) {
         console.warn('[CPCC] clickable target not found', card);
+        setStatus(`${workName}: クリック対象が見つかりません ${card.name}`);
         continue;
       }
 
+      console.log('[CPCC] click card', card.name, target);
+      highlightElement(slot, 'lime');
       simulateClick(target);
-      await sleep(CONFIG.autoClickDelayLong);
+      await sleep(700);
+      highlightElement(target, 'red');
+
+      // 本当にセットされたか軽く確認
+      const countNow = parseCurrentCount(findWorkRoot(workName));
+      console.log('[CPCC] current count', workName, countNow);
     }
 
     setStatus(`${workName}: 自動セット完了`);
+  }
+
+  function highlightElement(el, color = 'red') {
+    if (!el) return;
+    const old = el.style.outline;
+    el.style.outline = `3px solid ${color}`;
+    setTimeout(() => {
+      el.style.outline = old;
+    }, 1200);
   }
 
   async function clearWorkDeck(workName) {
@@ -904,22 +958,28 @@
 
   function findNextEmptySlot(workRoot) {
     const candidates = [...workRoot.querySelectorAll('*')];
-    let best = null;
 
-    for (const el of candidates) {
-      const text = normalizeSpace(el.textContent || '');
-      const title = normalizeSpace(el.getAttribute?.('title') || '');
-
-      if (!(text.includes('空き') || text.includes('＋') || text === '+' || title.includes('空き'))) continue;
+    // 「空き」と出ているカード枠候補を優先
+    const slotCandidates = candidates.filter(el => {
+      const text = normalizeSpace(el.innerText || el.textContent || '');
+      if (!text.includes('空き')) return false;
 
       const rect = safeRect(el);
-      if (rect.width < 30 || rect.height < 30) continue;
+      if (rect.width < 80 || rect.height < 80) return false;
 
-      best = el;
-      break;
-    }
+      return true;
+    });
 
-    return best;
+    if (!slotCandidates.length) return null;
+
+    // その中で一番カード枠っぽい大きさのものを返す
+    slotCandidates.sort((a, b) => {
+      const ra = safeRect(a);
+      const rb = safeRect(b);
+      return (rb.width * rb.height) - (ra.width * ra.height);
+    });
+
+    return slotCandidates[0];
   }
 
   function findFilledWorkCardTargets(workRoot) {
@@ -983,17 +1043,54 @@
   }
 
   function findClickableCardTarget(cardRoot) {
-    const mainImg = findMainCardImage(cardRoot);
-    if (mainImg) return mainImg;
+    if (!cardRoot) return null;
+
+    // 画像単体ではなくカード全体を押したほうが安定
+    let current = cardRoot;
+    while (current && current !== document.body) {
+      const text = normalizeSpace(current.innerText || current.textContent || '');
+      const rect = safeRect(current);
+
+      if (/Power\s*\d+/i.test(text) && rect.width >= 120 && rect.height >= 180) {
+        return current;
+      }
+
+      current = current.parentElement;
+    }
+
     return cardRoot;
   }
 
   function simulateClick(el) {
-    if (!el) return;
-    el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true, view: window }));
-    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
-    el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
-    el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+    if (!el) return false;
+
+    try {
+      el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+    } catch { }
+
+    const rect = safeRect(el);
+    const clientX = rect.left + rect.width / 2;
+    const clientY = rect.top + rect.height / 2;
+
+    const events = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+
+    for (const type of events) {
+      const ev = new MouseEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+        clientX,
+        clientY,
+      });
+      el.dispatchEvent(ev);
+    }
+
+    // ネイティブ click も呼ぶ
+    if (typeof el.click === 'function') {
+      el.click();
+    }
+
+    return true;
   }
 
   // =========================
@@ -1041,6 +1138,34 @@
       return el.getBoundingClientRect();
     } catch {
       return { width: 0, height: 0 };
+    }
+  }
+
+  function clearAllHighlights() {
+    document.querySelectorAll('.cpcc-highlight-card').forEach(el => {
+      el.classList.remove('cpcc-highlight-card');
+      el.removeAttribute('data-cpcc-work');
+    });
+  }
+
+  function highlightDeck(deck, workName) {
+    for (const card of deck) {
+      const root = findOwnedCardRootForSelection(card);
+      if (!root) {
+        console.warn('[CPCC] highlight target not found', workName, card);
+        continue;
+      }
+
+      root.classList.add('cpcc-highlight-card');
+      root.setAttribute('data-cpcc-work', workName);
+
+      try {
+        root.scrollIntoView({
+          block: 'center',
+          inline: 'center',
+          behavior: 'smooth',
+        });
+      } catch { }
     }
   }
 
