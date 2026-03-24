@@ -12,6 +12,10 @@
   const CONFIG = {
     topDeckOptionsPerWork: 120, // 各ワークで保持する候補デッキ数
     optimizeYieldEvery: 250,
+    prefilterOverallKeep: 260,
+    prefilterPerClubKeep: 32,
+    prefilterFocusClubCount: 10,
+    prefilterMinPowerExtraKeep: 60,
     candidateOverallKeep: 180,
     candidatePerClubKeep: 24,
     candidateFocusClubCount: 8,
@@ -100,6 +104,13 @@
     state.works = detectWorks();
     setStatus(`総所持 ${allOwnedRoots.length} 枚 / 未使用 ${state.cards.length} 枚 / ワーク ${state.works.filter(w => w.unlocked).length} 件を読み込みました`);
     setResultHtml(renderLoadedPreview());
+  }
+
+  function syncStateSilently() {
+    const allOwnedRoots = findOwnedCardRoots();
+    state.cards = parseOwnedCardsRobust();
+    state.works = detectWorks();
+    setStatus(`総所持 ${allOwnedRoots.length} 枚 / 未使用 ${state.cards.length} 枚 / ワーク ${state.works.filter(w => w.unlocked).length} 件を再同期しました`);
   }
 
   // =========================
@@ -194,8 +205,7 @@
           transition: box-shadow .15s ease, outline-color .15s ease;
         }
 
-        .cpcc-highlight-card[data-cpcc-work]::after{
-          content: attr(data-cpcc-work);
+        .cpcc-highlight-badge{
           position: absolute;
           left: 8px;
           top: 8px;
@@ -329,24 +339,6 @@
         clearAllHighlights();
         highlightDeck(plan.deck, workName);
         setStatus(`${workName}: ${plan.deck.length} 枚をハイライトしました`);
-      };
-    });
-
-    document.querySelectorAll('[data-cpcc-action="highlight-global"]').forEach(btn => {
-      btn.onclick = () => {
-        if (!state.globalPlan?.byWork) {
-          alert('先に全ワーク最適化を実行してください');
-          return;
-        }
-
-        clearAllHighlights();
-
-        for (const [workName, plan] of Object.entries(state.globalPlan.byWork)) {
-          if (!plan?.deck?.length) continue;
-          highlightDeck(plan.deck, workName);
-        }
-
-        setStatus('全プランのカードをハイライトしました');
       };
     });
 
@@ -964,6 +956,92 @@
     return { byId };
   }
 
+  function prefilterCardsForSearch(cards, rule) {
+    const sourceCards = getRuleRelevantCards(cards, rule);
+    const ranked = [...sourceCards].sort((a, b) => estimateCardValueFast(b, rule) - estimateCardValueFast(a, rule));
+    const picked = [];
+    const seen = new Set();
+
+    const pushCard = (card) => {
+      if (!card || seen.has(card.id)) return;
+      seen.add(card.id);
+      picked.push(card);
+    };
+
+    ranked.slice(0, CONFIG.prefilterOverallKeep).forEach(pushCard);
+
+    for (const club of getFastFocusClubs(ranked, rule)) {
+      ranked
+        .filter(card => card.club === club || card.effects.some(eff => eff.value > 0 && eff.club === club))
+        .slice(0, CONFIG.prefilterPerClubKeep)
+        .forEach(pushCard);
+    }
+
+    if (rule.type === 'minPower') {
+      ranked
+        .filter(card => card.power < rule.minPower)
+        .slice(0, CONFIG.prefilterMinPowerExtraKeep)
+        .forEach(pushCard);
+    }
+
+    return picked;
+  }
+
+  function estimateCardValueFast(card, rule) {
+    let score = applyWorkBase(card, rule);
+    let positiveTotal = 0;
+    let relevantPositive = 0;
+    let negativeTotal = 0;
+    const targetClubs = new Set(rule.clubs || []);
+
+    for (const eff of card.effects) {
+      if (eff.value > 0) {
+        positiveTotal += eff.value;
+        if (targetClubs.has(eff.club) || eff.club === card.club) relevantPositive += eff.value;
+      } else if (eff.value < 0) {
+        negativeTotal += Math.abs(eff.value);
+      }
+    }
+
+    score += positiveTotal * 2.4;
+    score += relevantPositive * 3.2;
+    score -= negativeTotal * 1.1;
+
+    if (rule.type === 'minPower' && card.power < rule.minPower) {
+      score += (rule.minPower - card.power) * 2.2;
+    }
+    if (rule.type === 'clubMultiplier' && targetClubs.has(card.club)) {
+      score += applyWorkBase(card, rule) * 0.3;
+    }
+    if (rule.type === 'onlyClub' && targetClubs.has(card.club)) {
+      score += applyWorkBase(card, rule) * 0.5;
+    }
+    if (rule.type === 'rarityMultiplier' && rule.rarities?.includes(card.rarity)) {
+      score += applyWorkBase(card, rule) * 0.25;
+    }
+
+    return score;
+  }
+
+  function getFastFocusClubs(rankedCards, rule) {
+    if (rule.clubs?.length) return [...new Set(rule.clubs)];
+
+    const scores = new Map();
+    for (const card of rankedCards.slice(0, CONFIG.prefilterOverallKeep)) {
+      const fastScore = estimateCardValueFast(card, rule);
+      scores.set(card.club, (scores.get(card.club) || 0) + fastScore);
+      for (const eff of card.effects) {
+        if (eff.value <= 0) continue;
+        scores.set(eff.club, (scores.get(eff.club) || 0) + eff.value * 8);
+      }
+    }
+
+    return [...scores.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, CONFIG.prefilterFocusClubCount)
+      .map(([club]) => club);
+  }
+
   function buildCandidates(cards, rule, analysis = null) {
     const sourceCards = getRuleRelevantCards(cards, rule);
     const ranked = [...sourceCards].sort((a, b) => estimateCardValue(b, rule, analysis) - estimateCardValue(a, rule, analysis));
@@ -1032,8 +1110,9 @@
 
   async function searchTopDeckOptions(cards, workName, maxKeep = CONFIG.topDeckOptionsPerWork, onProgress = null) {
     const rule = WORK_RULES[workName];
-    const analysis = createCardAnalysis(cards, rule);
-    const candidates = buildCandidates(cards, rule, analysis);
+    const prefilteredCards = prefilterCardsForSearch(cards, rule);
+    const analysis = createCardAnalysis(prefilteredCards, rule);
+    const candidates = buildCandidates(prefilteredCards, rule, analysis);
     const emptyOption = {
       workName,
       deck: [],
@@ -1553,9 +1632,6 @@
         <div class="cpcc-card">
           <div class="cpcc-title">${escapeHtml(workName)}</div>
           <div class="cpcc-score">推定Power: ${formatNum(item.score || 0)}</div>
-          <div class="cpcc-btns">
-            <button class="green" data-cpcc-action="highlight-global">全プランをハイライト</button>
-          </div>
         </div>
         ${renderDeckCards(item.deck || [], item.detail || { byCard: {} })}
       `);
@@ -1623,28 +1699,17 @@
     setStatus('全プラン自動セットを開始します...');
 
     const targetWorks = getOrderedUnlockedWorks(state.works);
-    const removalPlan = [];
+
+    for (const workName of targetWorks) {
+      await clearWorkDeck(workName);
+    }
+
+    syncStateSilently();
 
     for (const workName of targetWorks) {
       const item = byWork[workName];
-      if (!item) continue;
-      const currentEntries = getCurrentWorkCardEntries(workName);
-      const diff = diffWorkDeck(currentEntries, item.deck || []);
-      if (diff.toRemove.length) {
-        removalPlan.push({ workName, entries: diff.toRemove });
-      }
-    }
-
-    for (const step of removalPlan) {
-      await removeWorkEntries(step.workName, step.entries);
-    }
-
-    reloadAll();
-
-    for (const workName of targetWorks) {
-      const item = byWork[workName];
-      if (!item) continue;
-      await autoSetWorkDeck(workName, item.deck, { skipRemoval: true });
+      if (!item?.deck?.length) continue;
+      await autoSetWorkDeck(workName, item.deck);
     }
 
     setStatus('全プランの自動セットが完了しました');
@@ -1936,6 +2001,45 @@
     return findOwnedCardRootForSelectionEx(card);
   }
 
+  function findCardRootForHighlight(card, opts = {}) {
+    const excludeRoots = opts.excludeRoots || new Set();
+    const preferredWorkName = opts.preferredWorkName || '';
+    const searchRoots = [];
+    const pushRoots = (roots) => {
+      for (const root of roots) {
+        if (!root || excludeRoots.has(root)) continue;
+        searchRoots.push(root);
+      }
+    };
+
+    if (preferredWorkName) {
+      const preferredRoot = findWorkRoot(preferredWorkName);
+      if (preferredRoot) pushRoots(findFilledWorkCardRoots(preferredRoot));
+    }
+
+    for (const workName of WORK_ORDER) {
+      if (workName === preferredWorkName) continue;
+      const workRoot = findWorkRoot(workName);
+      if (workRoot) pushRoots(findFilledWorkCardRoots(workRoot));
+    }
+
+    pushRoots(findOwnedCardRoots());
+
+    let exact = searchRoots.find(root => isMatchingCardRoot(root, card));
+    if (exact) return exact;
+
+    exact = searchRoots.find(root => {
+      const parsed = parseCardSignature(root);
+      return parsed && parsed.name === card.name && parsed.power === card.power;
+    });
+    if (exact) return exact;
+
+    return searchRoots.find(root => {
+      const parsed = parseCardSignature(root);
+      return parsed && parsed.name === card.name;
+    }) || null;
+  }
+
   function findOwnedCardRootByOccurrence(card, occurrence = 1) {
     const roots = findOwnedCardRoots().filter(root => {
       const parsed = parseCardSignature(root);
@@ -2166,14 +2270,16 @@
     document.querySelectorAll('.cpcc-highlight-card').forEach(el => {
       el.classList.remove('cpcc-highlight-card');
       el.removeAttribute('data-cpcc-work');
+      el.querySelectorAll('.cpcc-highlight-badge').forEach(badge => badge.remove());
     });
   }
 
-  function highlightDeck(deck, workName) {
-    const usedRoots = new Set();
-
+  function highlightDeck(deck, workName, usedRoots = new Set()) {
     for (const card of deck) {
-      const root = findOwnedCardRootForSelectionEx(card, { excludeRoots: usedRoots });
+      const root = findCardRootForHighlight(card, {
+        excludeRoots: usedRoots,
+        preferredWorkName: workName,
+      });
       if (!root) {
         continue;
       }
@@ -2181,7 +2287,19 @@
       usedRoots.add(root);
       root.classList.add('cpcc-highlight-card');
       root.setAttribute('data-cpcc-work', workName);
+      ensureHighlightBadge(root, workName);
     }
+  }
+
+  function ensureHighlightBadge(root, workName) {
+    if (!root) return;
+    let badge = root.querySelector(':scope > .cpcc-highlight-badge');
+    if (!badge) {
+      badge = document.createElement('div');
+      badge.className = 'cpcc-highlight-badge';
+      root.appendChild(badge);
+    }
+    badge.textContent = workName;
   }
 
   // =========================
