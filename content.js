@@ -55,6 +55,14 @@
   };
 
   const WORK_ORDER = Object.keys(WORK_RULES);
+  const GLOBAL_WORK_PRIORITY = [
+    'ダンスステージ',
+    'カフェバー',
+    'ポータル',
+    '作業部屋',
+    'たまり場',
+    '生徒会室',
+  ];
   const WORK_DOM_IDS = {
     'たまり場': 'tamari',
     '生徒会室': 'council',
@@ -1247,7 +1255,7 @@
     const searched = await searchTopDeckOptions(cards, workName, 1, (message) => {
       setStatus(message);
     });
-    const top = searched.options[0] || { deck: [], score: 0, detail: { total: 0, byCard: {} } };
+    const top = findBestNonEmptyOption(searched.options) || searched.options[0] || { deck: [], score: 0, detail: { total: 0, byCard: {} } };
     return {
       workName,
       deck: top.deck,
@@ -1259,19 +1267,8 @@
   }
 
   async function findGlobalBestAllocation(cards, works, onProgress = null) {
-    const unlockedWorks = works.filter(w => w.unlocked).map(w => w.name);
-    const searchedByWork = [];
-    for (const workName of unlockedWorks) {
-      searchedByWork.push(await searchTopDeckOptions(cards, workName, CONFIG.topDeckOptionsPerWork, (message) => {
-        onProgress?.(message);
-      }));
-    }
-
-    // 候補数が少ない順に並べた方が探索しやすい
-    searchedByWork.sort((a, b) => a.options.length - b.options.length);
-
-    let bestScore = 0;
-    let bestByWork = Object.fromEntries(unlockedWorks.map(workName => [workName, {
+    const unlockedWorks = getOrderedUnlockedWorks(works);
+    const byWork = Object.fromEntries(unlockedWorks.map(workName => [workName, {
       workName,
       deck: [],
       score: 0,
@@ -1279,101 +1276,45 @@
       key: '',
       exploredAt: 0,
     }]));
+    const searchedByWork = [];
+    let totalScore = 0;
     let nodes = 0;
-    const ticker = createOptimizationTicker();
-    const stateCache = new Map();
-    const cardIndexById = new Map();
+    let remainingCards = [...cards];
 
-    for (const card of cards) {
-      if (!cardIndexById.has(card.id)) {
-        cardIndexById.set(card.id, cardIndexById.size);
+    for (let index = 0; index < unlockedWorks.length; index++) {
+      const workName = unlockedWorks[index];
+      onProgress?.(`全体割当探索: ${workName} を探索中 (${index + 1}/${unlockedWorks.length})`);
+      const searched = await searchTopDeckOptions(remainingCards, workName, CONFIG.topDeckOptionsPerWork, (message) => {
+        onProgress?.(message);
+      });
+      searchedByWork.push(searched);
+
+      const selected = findBestNonEmptyOption(searched.options);
+      if (!selected) {
+        throw new Error(`${workName} に割り当てられる非空デッキが見つかりませんでした`);
       }
+
+      byWork[workName] = selected;
+      totalScore += selected.score || 0;
+      nodes += searched.explored || 0;
+      remainingCards = removeSelectedCards(remainingCards, selected.deck);
     }
 
-    await dfs(0, new Set(), {}, 0);
-
     return {
-      totalScore: bestScore,
-      byWork: bestByWork,
+      totalScore,
+      byWork,
       nodes,
       searchedByWork,
     };
-
-    async function dfs(index, usedCardIds, currentByWork, currentScore) {
-      await ticker.tick();
-      nodes++;
-      if (nodes === 1 || nodes % 500 === 0) {
-        onProgress?.(`全体割当探索: ${nodes.toLocaleString()} ノード / 暫定合計 ${formatNum(bestScore)}`);
-      }
-
-      if (index >= searchedByWork.length) {
-        if (currentScore > bestScore) {
-          bestScore = currentScore;
-          bestByWork = clonePlan(currentByWork);
-        }
-        return;
-      }
-
-      const stateKey = makeAllocationStateKey(index, usedCardIds, cardIndexById);
-      const cachedBest = stateCache.get(stateKey);
-      if (cachedBest != null && cachedBest >= currentScore) return;
-      stateCache.set(stateKey, currentScore);
-
-      const optimistic = currentScore + sumRemainingBest(index);
-      if (optimistic <= bestScore) return;
-
-      const item = searchedByWork[index];
-      const options = item.options;
-
-      for (const option of options) {
-        if (!canUseOption(option, usedCardIds)) continue;
-
-        const added = [];
-        for (const card of option.deck) {
-          usedCardIds.add(card.id);
-          added.push(card.id);
-        }
-
-        currentByWork[item.workName] = option;
-        await dfs(index + 1, usedCardIds, currentByWork, currentScore + option.score);
-
-        delete currentByWork[item.workName];
-        for (const id of added) usedCardIds.delete(id);
-      }
-    }
-
-    function sumRemainingBest(startIndex) {
-      let s = 0;
-      for (let i = startIndex; i < searchedByWork.length; i++) {
-        s += searchedByWork[i].options[0]?.score || 0;
-      }
-      return s;
-    }
   }
 
-  function makeAllocationStateKey(index, usedCardIds, cardIndexById) {
-    const used = [];
-    for (const id of usedCardIds) {
-      const idx = cardIndexById.get(id);
-      if (idx != null) used.push(idx);
-    }
-    used.sort((a, b) => a - b);
-    return `${index}:${used.join(',')}`;
+  function getOrderedUnlockedWorks(works) {
+    const unlocked = new Set(works.filter(w => w.unlocked).map(w => w.name));
+    return GLOBAL_WORK_PRIORITY.filter(workName => unlocked.has(workName));
   }
 
-  function canUseOption(option, usedCardIds) {
-    for (const card of option.deck) {
-      if (usedCardIds.has(card.id)) return false;
-    }
-    return true;
-  }
-
-  function clonePlan(byWork) {
-    const out = {};
-    for (const [k, v] of Object.entries(byWork)) {
-      out[k] = v;
-    }
-    return out;
+  function findBestNonEmptyOption(options) {
+    return (options || []).find(option => option.deck?.length > 0) || null;
   }
 
   // =========================
@@ -1405,13 +1346,19 @@
     ];
 
     setStatus('全ワーク最適化: 候補デッキの探索を開始します...');
-    const plan = await findGlobalBestAllocation(allCards, state.works, (message) => {
-      setStatus(message);
-    });
+    try {
+      const plan = await findGlobalBestAllocation(allCards, state.works, (message) => {
+        setStatus(message);
+      });
 
-    state.globalPlan = plan;
-    setResultHtml(renderGlobalPlan(state.globalPlan));
-    setStatus(`全ワーク最適化が完了しました。合計推定Power ${formatNum(plan.totalScore)} / 探索 ${formatNum(plan.nodes)} ノード`);
+      state.globalPlan = plan;
+      setResultHtml(renderGlobalPlan(state.globalPlan));
+      setStatus(`全ワーク最適化が完了しました。合計推定Power ${formatNum(plan.totalScore)} / 探索 ${formatNum(plan.nodes)} ノード`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus(`全ワーク最適化に失敗しました: ${message}`);
+      alert(`全ワーク最適化に失敗しました\n${message}`);
+    }
   }
 
   function buildMacroGlobalPlan(byWork, unlockedWorks) {
