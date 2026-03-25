@@ -1951,6 +1951,7 @@
 
   async function runSingleWork(workName) {
     await ensureWorkTabActive();
+    await activateWorkBase(workName);
     if (!state.cards.length) reloadAll();
 
     const cardsForWork = [
