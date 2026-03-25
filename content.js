@@ -95,6 +95,7 @@
     optionFavoriteResults: [],
     powerFavoriteThreshold: 100,
     powerFavoriteResults: [],
+    clubDeckFavoriteResults: [],
   };
 
   const CACHE_INDEX_KEY = 'cpcc_optimizer_cache_index_v1';
@@ -159,6 +160,16 @@
       <div id="cpcc-status">初期化中...</div>
       <div class="cpcc-work-buttons">
         ${WORK_ORDER.map(w => `<button data-work="${escapeHtml(w)}">${escapeHtml(w)}</button>`).join('')}
+      </div>
+      <div class="cpcc-card">
+        <div class="cpcc-title">デッキ検索</div>
+        <div class="cpcc-inline">
+          <select id="cpcc-club-deck-select">
+            <option value="" selected hidden></option>
+            <option value="ごちゃまぜ">ごちゃまぜ</option>
+            ${CLUBS.map(club => `<option value="${escapeHtml(club)}">${escapeHtml(club)}</option>`).join('')}
+          </select>
+        </div>
       </div>
       <div class="cpcc-card">
         <div class="cpcc-title">オプションお気に入り</div>
@@ -228,6 +239,22 @@
         .cpcc-head{font-weight:700;font-size:14px;margin-bottom:8px}
         .cpcc-actions,.cpcc-work-buttons{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px}
         .cpcc-inline{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+        #cpcc-optimizer-root select{
+          min-width:160px;
+          border:none;
+          border-radius:8px;
+          padding:7px 10px;
+          background:rgba(255,255,255,.12);
+          color:#fff;
+          font-size:12px;
+          appearance:auto;
+          -webkit-appearance:menulist;
+        }
+        #cpcc-optimizer-root select option,
+        #cpcc-optimizer-root select optgroup{
+          background:#0f172a;
+          color:#f8fafc;
+        }
         #cpcc-option-threshold,#cpcc-power-threshold{
           width:96px;
           border:none;
@@ -317,6 +344,7 @@
     root.querySelector('#cpcc-option-threshold').addEventListener('change', handleOptionFavoriteThresholdChange);
     root.querySelector('#cpcc-power-search').addEventListener('click', runPowerFavoriteSearch);
     root.querySelector('#cpcc-power-threshold').addEventListener('change', handlePowerFavoriteThresholdChange);
+    root.querySelector('#cpcc-club-deck-select').addEventListener('change', runClubDeckFavoriteSearch);
 
     root.querySelectorAll('[data-work]').forEach(btn => {
       btn.addEventListener('click', () => runSingleWork(btn.dataset.work));
@@ -517,6 +545,28 @@
         btn.disabled = true;
         try {
           await favoritePowerSearchResults();
+        } finally {
+          btn.disabled = false;
+        }
+      };
+    });
+
+    document.querySelectorAll('[data-cpcc-action="favorite-club-deck-all"]').forEach(btn => {
+      btn.onclick = async () => {
+        btn.disabled = true;
+        try {
+          await favoriteClubDeckSearchResults();
+        } finally {
+          btn.disabled = false;
+        }
+      };
+    });
+
+    document.querySelectorAll('[data-cpcc-action="set-club-deck-active"]').forEach(btn => {
+      btn.onclick = async () => {
+        btn.disabled = true;
+        try {
+          await setClubDeckToActiveWork();
         } finally {
           btn.disabled = false;
         }
@@ -750,6 +800,25 @@
         </div>
       `;
     }).join('');
+  }
+
+  function renderClubDeckFavoriteResult(result) {
+    const deck = result?.deck || [];
+    const favorited = deck.filter(card => isInventoryCardFavorited(card)).length;
+    const unfavorited = deck.length - favorited;
+
+    return `
+      <div class="cpcc-card">
+        <div class="cpcc-title">${escapeHtml(result?.label || 'ごちゃまぜ')} デッキ</div>
+        <div class="cpcc-score">推定合計Power: ${formatNum(result?.score || 0)}</div>
+        <div class="cpcc-sub">カード枚数 ${formatNum(deck.length)}枚 / お気に入り ${formatNum(favorited)}枚 / 未お気に入り ${formatNum(unfavorited)}枚</div>
+        <div class="cpcc-btns">
+          <button class="green" data-cpcc-action="set-club-deck-active" ${deck.length ? '' : 'disabled'}>カードをセット</button>
+          <button class="green" data-cpcc-action="favorite-club-deck-all" ${unfavorited ? '' : 'disabled'}>全てお気に入りに入れる</button>
+        </div>
+      </div>
+      ${renderDeckCards(deck, result?.detail || { byCard: {} })}
+    `;
   }
 
   function renderLiveSearchPreview(workName, bestOption, progress = {}) {
@@ -2168,6 +2237,18 @@
     setStatus(`Power ${formatNum(result.threshold)} 以上のカードを ${formatNum(result.entries.length)} 枚見つけました`);
   }
 
+  async function runClubDeckFavoriteSearch() {
+    await ensureWorkTabActive();
+    const select = document.getElementById('cpcc-club-deck-select');
+    const clubName = select?.value || 'ごちゃまぜ';
+    setResultHtml('<div class="cpcc-card">デッキを検索中...</div>');
+    setStatus(`${clubName}: デッキを検索中...`);
+
+    const result = await searchBestFavoriteDeckByClub(clubName);
+    setResultHtml(renderClubDeckFavoriteResult(result));
+    setStatus(`${clubName}: デッキを見つけました`);
+  }
+
   async function runGlobalOptimization() {
     await ensureWorkTabActive();
     reloadAll();
@@ -2506,6 +2587,62 @@
     setStatus(`パワーお気に入り: 追加 ${added} 枚 / 既に登録 ${already} 枚 / 失敗 ${failed} 枚`);
   }
 
+  async function favoriteClubDeckSearchResults() {
+    const cards = [...(state.clubDeckFavoriteResults || [])];
+    if (!cards.length) {
+      setStatus('デッキの検索結果がありません');
+      return;
+    }
+
+    await ensureFiltersCleared();
+
+    let added = 0;
+    let already = 0;
+    let failed = 0;
+
+    for (const card of cards) {
+      const result = await favoriteCardWithRetry(card);
+      if (result === 'already') {
+        already++;
+      } else if (result === 'added') {
+        added++;
+      } else {
+        failed++;
+      }
+    }
+
+    const select = document.getElementById('cpcc-club-deck-select');
+    const clubName = select?.value || 'ごちゃまぜ';
+    const refreshed = await searchBestFavoriteDeckByClub(clubName);
+    setResultHtml(renderClubDeckFavoriteResult(refreshed));
+    setStatus(`デッキお気に入り: 追加 ${added} 枚 / 既に登録 ${already} 枚 / 失敗 ${failed} 枚`);
+  }
+
+  async function setClubDeckToActiveWork() {
+    await ensureWorkTabActive();
+    const activeWorkName = getActiveWorkName();
+    if (!activeWorkName) {
+      alert('アクティブなデッキが見つかりません');
+      return;
+    }
+
+    const deck = [...(state.clubDeckFavoriteResults || [])];
+    if (!deck.length) {
+      alert('先にデッキを検索してください');
+      return;
+    }
+
+    const conflicts = findDeckAssignmentConflicts(deck, activeWorkName);
+    if (conflicts.length) {
+      const lines = conflicts.map(item => `${item.card.name} は ${item.works.join(' / ')} で使用中です`);
+      alert(lines.join('\n'));
+      setStatus(`${activeWorkName}: 他デッキ使用中のカードがあるためセットできません`);
+      return;
+    }
+
+    await autoSetWorkDeck(activeWorkName, deck);
+  }
+
   function simulateFavoriteClick(el) {
     if (!el) return false;
 
@@ -2572,6 +2709,7 @@
     const targetDeck = deck || [];
     const currentEntries = getCurrentWorkCardEntries(workName);
     const diff = diffWorkDeck(currentEntries, targetDeck);
+    const targetCounts = buildDeckTargetCounts(targetDeck);
     const entriesToRemove = opts.skipRemoval ? [] : diff.toRemove;
 
     if (!entriesToRemove.length && !diff.toAdd.length) {
@@ -2585,7 +2723,14 @@
     await removeWorkEntries(workName, entriesToRemove);
 
     for (const card of diff.toAdd) {
-      const added = await addCardToWorkWithRetry(workName, card);
+      const key = getCardSignatureKey(card);
+      const currentCount = countCurrentWorkEntriesByKey(workName, key);
+      const requiredCount = targetCounts.get(key) || 1;
+      if (currentCount >= requiredCount) {
+        continue;
+      }
+
+      const added = await addCardToWorkWithRetry(workName, card, requiredCount);
       if (!added) {
         setStatus(`${workName}: 設定に失敗しました ${card.name}`);
       }
@@ -2600,8 +2745,13 @@
     }
   }
 
-  async function addCardToWorkWithRetry(workName, card, attempts = 3) {
+  async function addCardToWorkWithRetry(workName, card, requiredCount = 1, attempts = 3) {
+    const key = getCardSignatureKey(card);
     for (let attempt = 0; attempt < attempts; attempt++) {
+      if (countCurrentWorkEntriesByKey(workName, key) >= requiredCount) {
+        return true;
+      }
+
       const currentRoot = findWorkRoot(workName);
       const countBefore = currentRoot ? parseCurrentCount(currentRoot) : 0;
       if (countBefore >= 5) return true;
@@ -2623,7 +2773,7 @@
       highlightElement(target, 'red');
       await sleep(CONFIG.autoStepDelay);
       const changed = await waitForWorkCountAtLeast(workName, countBefore + 1, 3500);
-      if (changed) return true;
+      if (changed && countCurrentWorkEntriesByKey(workName, key) >= requiredCount) return true;
 
       await sleep(CONFIG.autoClickDelayLong);
     }
@@ -2865,6 +3015,23 @@
     }
 
     return { toRemove, toAdd };
+  }
+
+  function buildDeckTargetCounts(targetDeck) {
+    const counts = new Map();
+    for (const card of targetDeck || []) {
+      const key = getCardSignatureKey(card);
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+    return counts;
+  }
+
+  function countCurrentWorkEntriesByKey(workName, key) {
+    let count = 0;
+    for (const entry of getCurrentWorkCardEntries(workName)) {
+      if (entry.key === key) count++;
+    }
+    return count;
   }
 
   function findOwnedCardRootForSelection(card) {
@@ -3284,6 +3451,118 @@
 
     state.powerFavoriteResults = entries.map(entry => entry.card);
     return { threshold, entries };
+  }
+
+  function collectAllSearchableCards() {
+    return [
+      ...state.cards,
+      ...WORK_ORDER.flatMap(workName => getCardsCurrentlyInWork(workName)),
+    ];
+  }
+
+  async function searchBestFavoriteDeckByClub(clubName) {
+    const cards = collectAllSearchableCards();
+    const mixed = clubName === 'ごちゃまぜ';
+    const rule = mixed
+      ? { type: 'none', clubs: [] }
+      : { type: 'clubMultiplier', clubs: [clubName], multiplier: 1 };
+    const optionScan = await getOrCreateOptionScan(cards);
+    const workName = mixed ? 'ごちゃまぜ' : clubName;
+
+    let bestOption = null;
+
+    if (mixed) {
+      const focusClubs = getFocusClubsForWork(cards, rule, optionScan);
+      for (const focusClub of focusClubs) {
+        const baseOption = findBestDeckFromFocusedPool(buildFocusedPool(cards, focusClub, rule, optionScan), rule, workName, focusClub);
+        if (!baseOption?.option) continue;
+        const improved = improveDeckByExternalSwap(baseOption, cards, focusClub, rule, optionScan, workName);
+        const candidate = improved.option || baseOption.option;
+        if (!bestOption || (candidate.score || 0) > (bestOption.score || 0)) {
+          bestOption = candidate;
+        }
+      }
+    } else {
+      const focusedCards = cards.filter(card => (
+        card.club === clubName
+        || card.effects.some(eff => eff.value > 0 && eff.club === clubName)
+      ));
+      const sourceCards = focusedCards.length >= 5 ? focusedCards : cards;
+      const baseOption = findBestDeckFromFocusedPool(buildFocusedPool(sourceCards, clubName, rule, optionScan), rule, workName, clubName);
+      if (baseOption?.option) {
+        const improved = improveDeckByExternalSwap(baseOption, sourceCards, clubName, rule, optionScan, workName);
+        bestOption = improved.option || baseOption.option;
+      }
+    }
+
+    if (!bestOption?.deck?.length) {
+      const fallback = buildFallbackDeckOptions(cards, rule, workName, optionScan, 1);
+      bestOption = fallback.options[0] || null;
+    }
+
+    const result = {
+      label: clubName,
+      deck: bestOption?.deck || [],
+      score: bestOption?.score || 0,
+      detail: bestOption?.detail || evaluateDeck(bestOption?.deck || [], rule),
+    };
+    state.clubDeckFavoriteResults = result.deck || [];
+    return result;
+  }
+
+  function getActiveWorkName() {
+    for (const workName of WORK_ORDER) {
+      const root = findWorkRoot(workName);
+      if (root?.classList.contains('active-base')) {
+        return workName;
+      }
+    }
+    return null;
+  }
+
+  function findDeckAssignmentConflicts(targetDeck, activeWorkName) {
+    const targetCounts = new Map();
+    for (const card of targetDeck) {
+      const key = getCardSignatureKey(card);
+      targetCounts.set(key, {
+        card,
+        required: (targetCounts.get(key)?.required || 0) + 1,
+      });
+    }
+
+    const activeCounts = new Map();
+    for (const entry of getCurrentWorkCardEntries(activeWorkName)) {
+      activeCounts.set(entry.key, (activeCounts.get(entry.key) || 0) + 1);
+    }
+
+    const inventoryCounts = new Map();
+    for (const card of state.cards) {
+      const key = getCardSignatureKey(card);
+      inventoryCounts.set(key, (inventoryCounts.get(key) || 0) + 1);
+    }
+
+    const conflicts = [];
+    for (const { card, required } of targetCounts.values()) {
+      const key = getCardSignatureKey(card);
+      const available = (activeCounts.get(key) || 0) + (inventoryCounts.get(key) || 0);
+      if (available >= required) continue;
+
+      const usedWorks = [];
+      for (const workName of WORK_ORDER) {
+        if (workName === activeWorkName) continue;
+        const entries = getCurrentWorkCardEntries(workName);
+        if (entries.some(entry => entry.key === key)) {
+          usedWorks.push(workName);
+        }
+      }
+
+      conflicts.push({
+        card,
+        works: usedWorks.length ? usedWorks : ['別デッキ'],
+      });
+    }
+
+    return conflicts;
   }
 
   function isInventoryCardFavorited(card) {
