@@ -2188,10 +2188,6 @@
   function simulateFavoriteClick(el) {
     if (!el) return false;
 
-    try {
-      el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
-    } catch { }
-
     if (typeof el.click === 'function') {
       el.click();
       return true;
@@ -2302,7 +2298,7 @@
         continue;
       }
 
-      simulateClick(target);
+      simulateClick(target, { scroll: false });
       highlightElement(target, 'red');
       await sleep(CONFIG.autoStepDelay);
       const changed = await waitForWorkCountAtLeast(workName, countBefore + 1, 3500);
@@ -2326,7 +2322,7 @@
         return true;
       }
 
-      simulateClick(liveEntry);
+      simulateClick(liveEntry, { scroll: false });
       highlightElement(liveEntry, 'orange');
       await sleep(CONFIG.autoStepDelay);
       const changed = await waitForWorkCountLessThan(workName, countBefore, 4500);
@@ -2370,7 +2366,7 @@
 
       const target = cardTargets[cardTargets.length - 1];
       if (target) {
-        simulateClick(target);
+        simulateClick(target, { scroll: false });
         highlightElement(target, 'orange');
         await sleep(CONFIG.autoStepDelay);
         const changed = await waitForWorkCountLessThan(workName, countBefore, 4000);
@@ -2393,7 +2389,7 @@
     if (workRoot.classList.contains('active-base')) return true;
 
     const header = workRoot.querySelector('.base-header') || workRoot;
-    simulateClick(header);
+    simulateClick(header, { scroll: false });
     await waitUntil(() => workRoot.classList.contains('active-base'), 800);
     return workRoot.classList.contains('active-base');
   }
@@ -2666,12 +2662,15 @@
     return cardRoot;
   }
 
-  function simulateClick(el) {
+  function simulateClick(el, opts = {}) {
     if (!el) return false;
+    const shouldScroll = opts.scroll !== false;
 
-    try {
-      el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
-    } catch { }
+    if (shouldScroll) {
+      try {
+        el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+      } catch { }
+    }
 
     if (typeof el.click === 'function') {
       el.click();
