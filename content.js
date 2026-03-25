@@ -90,6 +90,7 @@
     singleResults: {},
     globalPlan: null,
     cacheIndexLoaded: false,
+    visibilityObserverStarted: false,
   };
 
   const CACHE_INDEX_KEY = 'cpcc_optimizer_cache_index_v1';
@@ -104,6 +105,9 @@
     if (document.getElementById('cpcc-optimizer-root')) return;
     ensureLauncherButton();
     createPanel();
+    ensureQuickFavoriteButtons();
+    ensureVisibilityObserver();
+    reconcileOptimizerVisibility();
     reloadAll();
   }
 
@@ -111,6 +115,7 @@
     const allOwnedRoots = findOwnedCardRoots();
     state.cards = parseOwnedCardsRobust();
     state.works = detectWorks();
+    ensureQuickFavoriteButtons();
     setStatus(`総所持 ${allOwnedRoots.length} 枚 / 未使用 ${state.cards.length} 枚 / ワーク ${state.works.filter(w => w.unlocked).length} 件を読み込みました`);
     setResultHtml(renderLoadedPreview());
     void pruneInvalidCachedSearches();
@@ -120,6 +125,7 @@
     const allOwnedRoots = findOwnedCardRoots();
     state.cards = parseOwnedCardsRobust();
     state.works = detectWorks();
+    ensureQuickFavoriteButtons();
     setStatus(`総所持 ${allOwnedRoots.length} 枚 / 未使用 ${state.cards.length} 枚 / ワーク ${state.works.filter(w => w.unlocked).length} 件を再同期しました`);
     void pruneInvalidCachedSearches();
   }
@@ -245,6 +251,17 @@
           outline: 3px solid #60a5fa;
           box-shadow: 0 0 18px rgba(96,165,250,.55);
         }
+        .btn-quick-favorite{
+          border:none;
+          border-radius:8px;
+          cursor:pointer;
+          padding:4px 6px;
+          background:linear-gradient(180deg,#facc15,#f59e0b);
+          color:#111827;
+          box-shadow:0 2px 8px rgba(0,0,0,.18);
+        }
+        .btn-quick-favorite:hover{filter:brightness(1.06)}
+        .btn-quick-favorite:disabled{opacity:.6;cursor:wait}
       `;
       document.head.appendChild(style);
     }
@@ -276,6 +293,7 @@
   }
 
   function showPanel() {
+    if (!isWorkTabActive()) return;
     const root = document.getElementById('cpcc-optimizer-root');
     if (!root) {
       boot();
@@ -291,6 +309,63 @@
     btn.style.display = show ? '' : 'none';
   }
 
+  function isWorkTabActive() {
+    const deckTab = document.getElementById('nav-deck');
+    const fieldSection = document.getElementById('field-section');
+    const deckTabActive = !!deckTab && deckTab.classList.contains('active');
+    const fieldActive = !!fieldSection && fieldSection.classList.contains('active-view');
+    return deckTabActive && fieldActive;
+  }
+
+  function reconcileOptimizerVisibility() {
+    const root = document.getElementById('cpcc-optimizer-root');
+    const launcher = document.getElementById('cpcc-optimizer-launcher');
+    const active = isWorkTabActive();
+
+    if (!active) {
+      if (root) root.style.display = 'none';
+      if (launcher) launcher.style.display = 'none';
+      return;
+    }
+
+    if (root && root.style.display !== 'none') {
+      updateLauncherVisibility(false);
+      return;
+    }
+
+    updateLauncherVisibility(true);
+  }
+
+  function ensureVisibilityObserver() {
+    if (state.visibilityObserverStarted) return;
+    state.visibilityObserverStarted = true;
+
+    const observer = new MutationObserver(() => {
+      reconcileOptimizerVisibility();
+      ensureQuickFavoriteButtons();
+    });
+
+    const startObserve = () => {
+      if (!document.body) return false;
+      observer.observe(document.body, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        attributeFilter: ['class'],
+      });
+      return true;
+    };
+
+    if (!startObserve()) {
+      setTimeout(() => {
+        startObserve();
+        reconcileOptimizerVisibility();
+      }, 500);
+    }
+
+    window.addEventListener('popstate', reconcileOptimizerVisibility);
+  }
+
   function setStatus(text) {
     const el = document.getElementById('cpcc-status');
     if (el) el.textContent = text;
@@ -300,6 +375,31 @@
     const el = document.getElementById('cpcc-result');
     if (el) el.innerHTML = html;
     bindResultButtons();
+  }
+
+  async function ensureFiltersCleared() {
+    const resetBtn = document.getElementById('btn-reset-filters');
+    if (!resetBtn || !isWorkTabActive()) return;
+
+    const isAlreadyCleared = (() => {
+      const club = document.getElementById('filter-club');
+      const options = [...document.querySelectorAll('.filter-option-select')];
+      const clubOk = !club || club.value === 'all';
+      const optionsOk = options.every(select => select.value === 'all');
+      return clubOk && optionsOk;
+    })();
+
+    if (isAlreadyCleared) return;
+
+    simulateClick(resetBtn);
+    await waitUntil(() => {
+      const club = document.getElementById('filter-club');
+      const options = [...document.querySelectorAll('.filter-option-select')];
+      const clubOk = !club || club.value === 'all';
+      const optionsOk = options.every(select => select.value === 'all');
+      return clubOk && optionsOk;
+    }, 2000, 100);
+    await sleep(CONFIG.autoStepDelay);
   }
 
   function bindResultButtons() {
@@ -1989,11 +2089,80 @@
     return evaluateDeck(deck, rule);
   }
 
+  function ensureQuickFavoriteButtons() {
+    for (const workName of WORK_ORDER) {
+      const workRoot = findWorkRoot(workName);
+      if (!workRoot) continue;
+      const actions = workRoot.querySelector('.base-header .base-actions');
+      if (!actions) continue;
+      if (actions.querySelector(`[data-cpcc-favorite-all="${workName}"]`)) continue;
+
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'btn-quick-favorite';
+      btn.title = 'お気に入りに追加';
+      btn.dataset.cpccFavoriteAll = workName;
+      btn.innerHTML = '<span class="material-symbols-rounded">grade</span>';
+      btn.addEventListener('click', async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        btn.disabled = true;
+        try {
+          await favoriteWorkDeckCards(workName);
+        } finally {
+          btn.disabled = false;
+        }
+      });
+      actions.appendChild(btn);
+    }
+  }
+
+  async function favoriteWorkDeckCards(workName) {
+    await ensureFiltersCleared();
+    const entries = getCurrentWorkCardEntries(workName);
+    if (!entries.length) {
+      setStatus(`${workName}: お気に入り対象のカードがありません`);
+      return;
+    }
+
+    let added = 0;
+    let already = 0;
+
+    for (const entry of entries) {
+      const root = entry.root?.isConnected ? entry.root : findMatchingWorkEntryRoot(workName, entry.key);
+      if (!root) continue;
+
+      const favoriteButton = root.querySelector('.card-favorite-btn, .card-favorite-btn-active');
+      if (!favoriteButton) continue;
+
+      if (favoriteButton.classList.contains('card-favorite-btn-active')) {
+        already++;
+        continue;
+      }
+
+      simulateClick(favoriteButton);
+      highlightElement(favoriteButton, 'gold');
+      const changed = await waitUntil(() => {
+        const liveRoot = root.isConnected ? root : findMatchingWorkEntryRoot(workName, entry.key);
+        const liveButton = liveRoot?.querySelector('.card-favorite-btn, .card-favorite-btn-active');
+        return !!liveButton && liveButton.classList.contains('card-favorite-btn-active');
+      }, 1500, 80);
+
+      if (changed) {
+        added++;
+      }
+      await sleep(120);
+    }
+
+    setStatus(`${workName}: お気に入り追加 ${added} 枚 / 既に登録 ${already} 枚`);
+  }
+
   // =========================
   // 自動セット
   // =========================
 
   async function autoSetGlobalPlan(byWork) {
+    await ensureFiltersCleared();
     setStatus('全プラン自動セットを開始します...');
 
     const targetWorks = getOrderedUnlockedWorks(state.works);
@@ -2022,6 +2191,7 @@
   }
 
   async function autoSetWorkDeck(workName, deck, opts = {}) {
+    await ensureFiltersCleared();
     const work = state.works.find(w => w.name === workName) || { root: findWorkRoot(workName), unlocked: true };
     if (!work.root) {
       alert(`ワークが見つかりません: ${workName}`);
