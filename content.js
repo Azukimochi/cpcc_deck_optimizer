@@ -91,11 +91,14 @@
     globalPlan: null,
     cacheIndexLoaded: false,
     visibilityObserverStarted: false,
+    optionFavoriteThreshold: 1000,
+    optionFavoriteResults: [],
   };
 
   const CACHE_INDEX_KEY = 'cpcc_optimizer_cache_index_v1';
   const CACHE_KEY_PREFIX = 'cpcc_optimizer_cache_v1:';
   const OPTION_SCAN_CACHE_KEY_PREFIX = 'cpcc_optimizer_option_scan_v1:';
+  const OPTION_FAVORITE_THRESHOLD_KEY = 'cpcc_optimizer_option_favorite_threshold_v1';
 
   // =========================
   // 初期化
@@ -109,6 +112,9 @@
     ensureVisibilityObserver();
     reconcileOptimizerVisibility();
     reloadAll();
+    hydrateOptionFavoriteThreshold().catch(error => {
+      console.warn('[CPCC Optimizer] option favorite threshold init failed', error);
+    });
   }
 
   function reloadAll() {
@@ -147,6 +153,15 @@
       <div id="cpcc-status">初期化中...</div>
       <div class="cpcc-work-buttons">
         ${WORK_ORDER.map(w => `<button data-work="${escapeHtml(w)}">${escapeHtml(w)}</button>`).join('')}
+      </div>
+      <div class="cpcc-card">
+        <div class="cpcc-title">オプションお気に入り</div>
+        <div class="cpcc-inline">
+          <span>オプション値</span>
+          <input id="cpcc-option-threshold" type="number" min="0" step="100" value="1000">
+          <span>% 以上を</span>
+          <button id="cpcc-option-search">検索</button>
+        </div>
       </div>
       <div id="cpcc-result"></div>
     `;
@@ -197,6 +212,18 @@
         #cpcc-optimizer-root .gray{background:#475569}
         .cpcc-head{font-weight:700;font-size:14px;margin-bottom:8px}
         .cpcc-actions,.cpcc-work-buttons{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px}
+        .cpcc-inline{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+        #cpcc-option-threshold{
+          width:96px;
+          border:none;
+          border-radius:8px;
+          padding:7px 10px;
+          background:rgba(255,255,255,.12);
+          color:#fff;
+          font-size:12px;
+        }
+        #cpcc-option-threshold::-webkit-outer-spin-button,
+        #cpcc-option-threshold::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
         #cpcc-status{margin-bottom:8px;padding:8px;border-radius:8px;background:rgba(255,255,255,.08)}
         #cpcc-result{max-height:none;overflow:visible;padding-right:4px}
         .cpcc-card{padding:8px 10px;margin:6px 0;border-radius:8px;background:rgba(255,255,255,.08)}
@@ -269,6 +296,8 @@
     root.querySelector('#cpcc-reload').addEventListener('click', reloadAll);
     root.querySelector('#cpcc-run-all').addEventListener('click', runGlobalOptimization);
     root.querySelector('#cpcc-close').addEventListener('click', () => hidePanel());
+    root.querySelector('#cpcc-option-search').addEventListener('click', runOptionFavoriteSearch);
+    root.querySelector('#cpcc-option-threshold').addEventListener('change', handleOptionFavoriteThresholdChange);
 
     root.querySelectorAll('[data-work]').forEach(btn => {
       btn.addEventListener('click', () => runSingleWork(btn.dataset.work));
@@ -453,6 +482,17 @@
       };
     });
 
+    document.querySelectorAll('[data-cpcc-action="favorite-search-all"]').forEach(btn => {
+      btn.onclick = async () => {
+        btn.disabled = true;
+        try {
+          await favoriteOptionSearchResults();
+        } finally {
+          btn.disabled = false;
+        }
+      };
+    });
+
     document.querySelectorAll('[data-cpcc-action="highlight-work"]').forEach(btn => {
       btn.onclick = () => {
         const workName = btn.dataset.work;
@@ -585,6 +625,55 @@
     `;
   }
 
+  function renderOptionFavoriteSearchResult(result) {
+    const entries = result?.entries || [];
+    const total = entries.length;
+    const favorited = entries.filter(entry => entry.favoriteActive).length;
+    const unfavorited = total - favorited;
+
+    return `
+      <div class="cpcc-card">
+        <div class="cpcc-title">検索結果</div>
+        <div class="cpcc-sub">条件: 1部活のオプション合計が ${formatNum(result?.threshold || 0)}% 以上</div>
+        <div>カード枚数 ${formatNum(total)}枚</div>
+        <div>お気に入り ${formatNum(favorited)}枚</div>
+        <div>未お気に入り ${formatNum(unfavorited)}枚</div>
+        <div class="cpcc-btns">
+          <button class="green" data-cpcc-action="favorite-search-all" ${unfavorited ? '' : 'disabled'}>全てお気に入りに入れる</button>
+        </div>
+      </div>
+      ${renderOptionFavoriteSearchCards(entries)}
+    `;
+  }
+
+  function renderOptionFavoriteSearchCards(entries) {
+    if (!entries.length) {
+      return `<div class="cpcc-card"><span class="cpcc-muted">条件に一致するカードはありません</span></div>`;
+    }
+
+    return entries.map(({ card, metrics, favoriteActive, matchedClub, matchedValue }) => {
+      const eff = card.effects.length
+        ? card.effects.map(e => `${e.club} ${e.value > 0 ? '+' : ''}${e.value}%`).join(', ')
+        : '効果なし';
+
+      return `
+        <div
+          class="cpcc-card cpcc-result-card"
+          data-cpcc-card-id="${escapeHtml(card.id)}"
+          data-cpcc-card-sig="${escapeHtml(getCardSignatureKey(card))}"
+          data-cpcc-card-name="${escapeHtml(card.name)}"
+          title="クリックでカード位置へスクロール"
+        >
+          <div class="cpcc-title">${escapeHtml(card.name)} <span class="cpcc-sub">[${escapeHtml(card.rarity)}]</span></div>
+          <div>Power: ${formatNum(card.power)} / 部活: ${escapeHtml(card.club)}</div>
+          <div>${escapeHtml(matchedClub || metrics.maxBuffClub || '-')} 合計: <span class="cpcc-score">${formatNum(matchedValue || metrics.maxBuffTotal || 0)}%</span></div>
+          <div class="cpcc-muted">${escapeHtml(eff)}</div>
+          <div class="cpcc-sub">${favoriteActive ? 'お気に入り済み' : '未お気に入り'}</div>
+        </div>
+      `;
+    }).join('');
+  }
+
   function renderLiveSearchPreview(workName, bestOption, progress = {}) {
     const title = progress.mode === 'global'
       ? `全ワーク最適化中: ${workName} の暫定トップ`
@@ -631,6 +720,12 @@
     });
 
     return cards;
+  }
+
+  function parseAllOwnedInventoryCards() {
+    return findOwnedCardRoots()
+      .map((root, index) => parseCardFromRoot(root, `inventory-${index}`))
+      .filter(Boolean);
   }
 
   function findOwnedCardRoots() {
@@ -1977,6 +2072,15 @@
     setStatus(`${workName}: 最適化が完了しました`);
   }
 
+  async function runOptionFavoriteSearch() {
+    await persistOptionFavoriteThresholdFromInput();
+    await ensureWorkTabActive();
+    setStatus(`1部活のオプション合計が ${formatNum(state.optionFavoriteThreshold)}% 以上のカードを検索中...`);
+    const result = await collectOptionFavoriteSearchResult();
+    setResultHtml(renderOptionFavoriteSearchResult(result));
+    setStatus(`1部活のオプション合計が ${formatNum(result.threshold)}% 以上のカードを ${formatNum(result.entries.length)} 枚見つけました`);
+  }
+
   async function runGlobalOptimization() {
     await ensureWorkTabActive();
     reloadAll();
@@ -2220,6 +2324,10 @@
 
   async function favoriteWorkEntryWithRetry(entry, attempts = 3) {
     const card = entry.card || parseCardFromRoot(entry.root, 'fav-entry');
+    return favoriteCardWithRetry(card, attempts);
+  }
+
+  async function favoriteCardWithRetry(card, attempts = 3) {
     if (!card) return 'missing';
 
     for (let attempt = 0; attempt < attempts; attempt++) {
@@ -2251,6 +2359,35 @@
     }
 
     return 'failed';
+  }
+
+  async function favoriteOptionSearchResults() {
+    const cards = [...(state.optionFavoriteResults || [])];
+    if (!cards.length) {
+      setStatus('検索結果のカードがありません');
+      return;
+    }
+
+    await ensureFiltersCleared();
+
+    let added = 0;
+    let already = 0;
+    let failed = 0;
+
+    for (const card of cards) {
+      const result = await favoriteCardWithRetry(card);
+      if (result === 'already') {
+        already++;
+      } else if (result === 'added') {
+        added++;
+      } else {
+        failed++;
+      }
+    }
+
+    const refreshed = await collectOptionFavoriteSearchResult();
+    setResultHtml(renderOptionFavoriteSearchResult(refreshed));
+    setStatus(`オプションお気に入り: 追加 ${added} 枚 / 既に登録 ${already} 枚 / 失敗 ${failed} 枚`);
   }
 
   function simulateFavoriteClick(el) {
@@ -2862,6 +2999,44 @@
     return Number(v || 0).toLocaleString();
   }
 
+  function normalizeOptionFavoriteThreshold(value) {
+    const num = Number(value);
+    if (!Number.isFinite(num) || num < 0) return 1000;
+    return Math.floor(num);
+  }
+
+  function getOptionThresholdInput() {
+    return document.getElementById('cpcc-option-threshold');
+  }
+
+  async function hydrateOptionFavoriteThreshold() {
+    const stored = await storageGet(OPTION_FAVORITE_THRESHOLD_KEY);
+    const threshold = normalizeOptionFavoriteThreshold(stored?.[OPTION_FAVORITE_THRESHOLD_KEY]);
+    state.optionFavoriteThreshold = threshold;
+    const input = getOptionThresholdInput();
+    if (input) {
+      input.value = String(threshold);
+    }
+  }
+
+  async function handleOptionFavoriteThresholdChange(event) {
+    const threshold = normalizeOptionFavoriteThreshold(event?.target?.value);
+    state.optionFavoriteThreshold = threshold;
+    if (event?.target) {
+      event.target.value = String(threshold);
+    }
+    await storageSet({ [OPTION_FAVORITE_THRESHOLD_KEY]: threshold });
+  }
+
+  async function persistOptionFavoriteThresholdFromInput() {
+    const input = getOptionThresholdInput();
+    if (!input) return;
+    const threshold = normalizeOptionFavoriteThreshold(input.value);
+    state.optionFavoriteThreshold = threshold;
+    input.value = String(threshold);
+    await storageSet({ [OPTION_FAVORITE_THRESHOLD_KEY]: threshold });
+  }
+
   function getStorageArea() {
     return globalThis.chrome?.storage?.local || null;
   }
@@ -2903,6 +3078,60 @@
       },
     });
     return scan;
+  }
+
+  async function collectOptionFavoriteSearchResult() {
+    const threshold = normalizeOptionFavoriteThreshold(state.optionFavoriteThreshold);
+    state.optionFavoriteThreshold = threshold;
+
+    const cards = parseAllOwnedInventoryCards();
+    const optionScan = await getOrCreateOptionScan(cards);
+    const entries = cards
+      .map(card => {
+        const metrics = getOptionScanInfo(card, optionScan);
+        const bestMatch = getOptionFavoriteBestMatch(metrics);
+        return {
+          card,
+          metrics,
+          favoriteActive: isInventoryCardFavorited(card),
+          matchedClub: bestMatch.club,
+          matchedValue: bestMatch.value,
+        };
+      })
+      .filter(entry => (entry.matchedValue || 0) >= threshold)
+      .sort((a, b) => {
+        const totalDiff = (b.matchedValue || 0) - (a.matchedValue || 0);
+        if (totalDiff !== 0) return totalDiff;
+        const scoreDiff = (b.metrics?.optionScore || 0) - (a.metrics?.optionScore || 0);
+        if (scoreDiff !== 0) return scoreDiff;
+        return (b.card?.power || 0) - (a.card?.power || 0);
+      });
+
+    state.optionFavoriteResults = entries.map(entry => entry.card);
+    return { threshold, entries };
+  }
+
+  function isInventoryCardFavorited(card) {
+    const root = findOwnedInventoryCardRoot(card, { excludeInDeck: false });
+    const favoriteButton = root?.querySelector('.card-favorite-btn, .card-favorite-btn-active');
+    return !!favoriteButton?.classList.contains('card-favorite-btn-active');
+  }
+
+  function getOptionFavoriteBestMatch(metrics) {
+    if (!metrics?.buffByClub) {
+      return { club: '', value: 0 };
+    }
+
+    let club = '';
+    let value = 0;
+    for (const [name, total] of metrics.buffByClub.entries()) {
+      if (total > value) {
+        club = name;
+        value = total;
+      }
+    }
+
+    return { club, value };
   }
 
   function computeOptionScan(cards) {
