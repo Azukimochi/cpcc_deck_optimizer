@@ -317,6 +317,20 @@
     return deckTabActive && fieldActive;
   }
 
+  async function ensureWorkTabActive() {
+    if (isWorkTabActive()) return true;
+
+    const deckTab = document.getElementById('nav-deck');
+    if (!deckTab) return false;
+
+    simulateClick(deckTab, { scroll: false });
+    const activated = await waitUntil(() => isWorkTabActive(), 2500, 100);
+    if (activated) {
+      await sleep(150);
+    }
+    return activated;
+  }
+
   function reconcileOptimizerVisibility() {
     const root = document.getElementById('cpcc-optimizer-root');
     const launcher = document.getElementById('cpcc-optimizer-launcher');
@@ -378,6 +392,7 @@
   }
 
   async function ensureFiltersCleared() {
+    await ensureWorkTabActive();
     const resetBtn = document.getElementById('btn-reset-filters');
     if (!resetBtn || !isWorkTabActive()) return;
 
@@ -677,17 +692,67 @@
     if (!info?.name || info.power == null || !info.club) return null;
 
     const effects = parseEffectsFromRoot(root);
+    const basePower = recoverCardBasePower(root, info, effects);
 
     return {
-      id: `${info.name}__${info.power}__${info.club}__${info.rarity}__${index}`,
+      id: `${info.name}__${basePower}__${info.club}__${info.rarity}__${index}`,
       name: info.name,
-      power: info.power,
+      power: basePower,
       club: info.club,
       rarity: info.rarity,
       effects,
       inDeck: root.classList.contains('in-deck'),
       root,
     };
+  }
+
+  function recoverCardBasePower(root, info, effects) {
+    if (isInventoryCardRoot(root)) {
+      return info.power;
+    }
+
+    const recovered = findInventoryBasePower(info, effects);
+    return recovered ?? info.power;
+  }
+
+  function isInventoryCardRoot(root) {
+    return !!root?.closest?.('#inventory-container');
+  }
+
+  function getCardIdentityKey(parts) {
+    return [
+      parts.name,
+      parts.club,
+      parts.rarity,
+      getEffectsSignature(parts.effects || []),
+    ].join('__');
+  }
+
+  function findInventoryBasePower(info, effects) {
+    const targetIdentity = getCardIdentityKey({
+      name: info.name,
+      club: info.club,
+      rarity: info.rarity,
+      effects,
+    });
+
+    for (const root of findOwnedCardRoots()) {
+      if (!isInventoryCardRoot(root)) continue;
+      const candidateInfo = parseCardSignature(root);
+      if (!candidateInfo?.name || candidateInfo.power == null || !candidateInfo.club) continue;
+      const candidateEffects = parseEffectsFromRoot(root);
+      const candidateIdentity = getCardIdentityKey({
+        name: candidateInfo.name,
+        club: candidateInfo.club,
+        rarity: candidateInfo.rarity,
+        effects: candidateEffects,
+      });
+      if (candidateIdentity === targetIdentity) {
+        return candidateInfo.power;
+      }
+    }
+
+    return null;
   }
 
   function parseRarity(root) {
@@ -1885,6 +1950,7 @@
   // =========================
 
   async function runSingleWork(workName) {
+    await ensureWorkTabActive();
     if (!state.cards.length) reloadAll();
 
     const cardsForWork = [
@@ -1911,6 +1977,7 @@
   }
 
   async function runGlobalOptimization() {
+    await ensureWorkTabActive();
     reloadAll();
 
     const allCards = [
@@ -2564,7 +2631,21 @@
       return true;
     });
 
-    return roots.find(root => getCardRootSignatureKey(root) === targetSignature) || null;
+    const exact = roots.find(root => getCardRootSignatureKey(root) === targetSignature);
+    if (exact) return exact;
+
+    const inventoryContainer = document.getElementById('inventory-container');
+    if (inventoryContainer && roots.length === 0) {
+      const fallbackRoots = [...document.querySelectorAll('.card')]
+        .filter(root => {
+          if (excludeRoots.has(root)) return false;
+          if (excludeInDeck && root.classList.contains('in-deck')) return false;
+          return !!findMainCardImage(root);
+        });
+      return fallbackRoots.find(root => getCardRootSignatureKey(root) === targetSignature) || null;
+    }
+
+    return null;
   }
 
   function findCardRootForHighlight(card, opts = {}) {
