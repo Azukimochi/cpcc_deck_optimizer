@@ -93,12 +93,15 @@
     visibilityObserverStarted: false,
     optionFavoriteThreshold: 1000,
     optionFavoriteResults: [],
+    powerFavoriteThreshold: 100,
+    powerFavoriteResults: [],
   };
 
   const CACHE_INDEX_KEY = 'cpcc_optimizer_cache_index_v1';
   const CACHE_KEY_PREFIX = 'cpcc_optimizer_cache_v1:';
   const OPTION_SCAN_CACHE_KEY_PREFIX = 'cpcc_optimizer_option_scan_v1:';
   const OPTION_FAVORITE_THRESHOLD_KEY = 'cpcc_optimizer_option_favorite_threshold_v1';
+  const POWER_FAVORITE_THRESHOLD_KEY = 'cpcc_optimizer_power_favorite_threshold_v1';
 
   // =========================
   // 初期化
@@ -114,6 +117,9 @@
     reloadAll();
     hydrateOptionFavoriteThreshold().catch(error => {
       console.warn('[CPCC Optimizer] option favorite threshold init failed', error);
+    });
+    hydratePowerFavoriteThreshold().catch(error => {
+      console.warn('[CPCC Optimizer] power favorite threshold init failed', error);
     });
   }
 
@@ -161,6 +167,15 @@
           <input id="cpcc-option-threshold" type="number" min="0" step="100" value="1000">
           <span>% 以上を</span>
           <button id="cpcc-option-search">検索</button>
+        </div>
+      </div>
+      <div class="cpcc-card">
+        <div class="cpcc-title">パワーお気に入り</div>
+        <div class="cpcc-inline">
+          <span>Power</span>
+          <input id="cpcc-power-threshold" type="number" min="0" step="10" value="100">
+          <span>以上を</span>
+          <button id="cpcc-power-search">検索</button>
         </div>
       </div>
       <div id="cpcc-result"></div>
@@ -213,7 +228,7 @@
         .cpcc-head{font-weight:700;font-size:14px;margin-bottom:8px}
         .cpcc-actions,.cpcc-work-buttons{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px}
         .cpcc-inline{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
-        #cpcc-option-threshold{
+        #cpcc-option-threshold,#cpcc-power-threshold{
           width:96px;
           border:none;
           border-radius:8px;
@@ -223,7 +238,9 @@
           font-size:12px;
         }
         #cpcc-option-threshold::-webkit-outer-spin-button,
-        #cpcc-option-threshold::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+        #cpcc-option-threshold::-webkit-inner-spin-button,
+        #cpcc-power-threshold::-webkit-outer-spin-button,
+        #cpcc-power-threshold::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
         #cpcc-status{margin-bottom:8px;padding:8px;border-radius:8px;background:rgba(255,255,255,.08)}
         #cpcc-result{max-height:none;overflow:visible;padding-right:4px}
         .cpcc-card{padding:8px 10px;margin:6px 0;border-radius:8px;background:rgba(255,255,255,.08)}
@@ -298,6 +315,8 @@
     root.querySelector('#cpcc-close').addEventListener('click', () => hidePanel());
     root.querySelector('#cpcc-option-search').addEventListener('click', runOptionFavoriteSearch);
     root.querySelector('#cpcc-option-threshold').addEventListener('change', handleOptionFavoriteThresholdChange);
+    root.querySelector('#cpcc-power-search').addEventListener('click', runPowerFavoriteSearch);
+    root.querySelector('#cpcc-power-threshold').addEventListener('change', handlePowerFavoriteThresholdChange);
 
     root.querySelectorAll('[data-work]').forEach(btn => {
       btn.addEventListener('click', () => runSingleWork(btn.dataset.work));
@@ -493,6 +512,17 @@
       };
     });
 
+    document.querySelectorAll('[data-cpcc-action="favorite-power-search-all"]').forEach(btn => {
+      btn.onclick = async () => {
+        btn.disabled = true;
+        try {
+          await favoritePowerSearchResults();
+        } finally {
+          btn.disabled = false;
+        }
+      };
+    });
+
     document.querySelectorAll('[data-cpcc-action="highlight-work"]').forEach(btn => {
       btn.onclick = () => {
         const workName = btn.dataset.work;
@@ -667,6 +697,54 @@
           <div class="cpcc-title">${escapeHtml(card.name)} <span class="cpcc-sub">[${escapeHtml(card.rarity)}]</span></div>
           <div>Power: ${formatNum(card.power)} / 部活: ${escapeHtml(card.club)}</div>
           <div>${escapeHtml(matchedClub || metrics.maxBuffClub || '-')} 合計: <span class="cpcc-score">${formatNum(matchedValue || metrics.maxBuffTotal || 0)}%</span></div>
+          <div class="cpcc-muted">${escapeHtml(eff)}</div>
+          <div class="cpcc-sub">${favoriteActive ? 'お気に入り済み' : '未お気に入り'}</div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  function renderPowerFavoriteSearchResult(result) {
+    const entries = result?.entries || [];
+    const total = entries.length;
+    const favorited = entries.filter(entry => entry.favoriteActive).length;
+    const unfavorited = total - favorited;
+
+    return `
+      <div class="cpcc-card">
+        <div class="cpcc-title">検索結果</div>
+        <div class="cpcc-sub">条件: Power が ${formatNum(result?.threshold || 0)} 以上</div>
+        <div>カード枚数 ${formatNum(total)}枚</div>
+        <div>お気に入り ${formatNum(favorited)}枚</div>
+        <div>未お気に入り ${formatNum(unfavorited)}枚</div>
+        <div class="cpcc-btns">
+          <button class="green" data-cpcc-action="favorite-power-search-all" ${unfavorited ? '' : 'disabled'}>全てお気に入りに入れる</button>
+        </div>
+      </div>
+      ${renderPowerFavoriteSearchCards(entries)}
+    `;
+  }
+
+  function renderPowerFavoriteSearchCards(entries) {
+    if (!entries.length) {
+      return `<div class="cpcc-card"><span class="cpcc-muted">条件に一致するカードはありません</span></div>`;
+    }
+
+    return entries.map(({ card, favoriteActive }) => {
+      const eff = card.effects.length
+        ? card.effects.map(e => `${e.club} ${e.value > 0 ? '+' : ''}${e.value}%`).join(', ')
+        : '効果なし';
+
+      return `
+        <div
+          class="cpcc-card cpcc-result-card"
+          data-cpcc-card-id="${escapeHtml(card.id)}"
+          data-cpcc-card-sig="${escapeHtml(getCardSignatureKey(card))}"
+          data-cpcc-card-name="${escapeHtml(card.name)}"
+          title="クリックでカード位置へスクロール"
+        >
+          <div class="cpcc-title">${escapeHtml(card.name)} <span class="cpcc-sub">[${escapeHtml(card.rarity)}]</span></div>
+          <div>Power: <span class="cpcc-score">${formatNum(card.power)}</span> / 部活: ${escapeHtml(card.club)}</div>
           <div class="cpcc-muted">${escapeHtml(eff)}</div>
           <div class="cpcc-sub">${favoriteActive ? 'お気に入り済み' : '未お気に入り'}</div>
         </div>
@@ -2081,6 +2159,15 @@
     setStatus(`1部活のオプション合計が ${formatNum(result.threshold)}% 以上のカードを ${formatNum(result.entries.length)} 枚見つけました`);
   }
 
+  async function runPowerFavoriteSearch() {
+    await persistPowerFavoriteThresholdFromInput();
+    await ensureWorkTabActive();
+    setStatus(`Power ${formatNum(state.powerFavoriteThreshold)} 以上のカードを検索中...`);
+    const result = await collectPowerFavoriteSearchResult();
+    setResultHtml(renderPowerFavoriteSearchResult(result));
+    setStatus(`Power ${formatNum(result.threshold)} 以上のカードを ${formatNum(result.entries.length)} 枚見つけました`);
+  }
+
   async function runGlobalOptimization() {
     await ensureWorkTabActive();
     reloadAll();
@@ -2388,6 +2475,35 @@
     const refreshed = await collectOptionFavoriteSearchResult();
     setResultHtml(renderOptionFavoriteSearchResult(refreshed));
     setStatus(`オプションお気に入り: 追加 ${added} 枚 / 既に登録 ${already} 枚 / 失敗 ${failed} 枚`);
+  }
+
+  async function favoritePowerSearchResults() {
+    const cards = [...(state.powerFavoriteResults || [])];
+    if (!cards.length) {
+      setStatus('検索結果のカードがありません');
+      return;
+    }
+
+    await ensureFiltersCleared();
+
+    let added = 0;
+    let already = 0;
+    let failed = 0;
+
+    for (const card of cards) {
+      const result = await favoriteCardWithRetry(card);
+      if (result === 'already') {
+        already++;
+      } else if (result === 'added') {
+        added++;
+      } else {
+        failed++;
+      }
+    }
+
+    const refreshed = await collectPowerFavoriteSearchResult();
+    setResultHtml(renderPowerFavoriteSearchResult(refreshed));
+    setStatus(`パワーお気に入り: 追加 ${added} 枚 / 既に登録 ${already} 枚 / 失敗 ${failed} 枚`);
   }
 
   function simulateFavoriteClick(el) {
@@ -3005,8 +3121,18 @@
     return Math.floor(num);
   }
 
+  function normalizePowerFavoriteThreshold(value) {
+    const num = Number(value);
+    if (!Number.isFinite(num) || num < 0) return 100;
+    return Math.floor(num);
+  }
+
   function getOptionThresholdInput() {
     return document.getElementById('cpcc-option-threshold');
+  }
+
+  function getPowerThresholdInput() {
+    return document.getElementById('cpcc-power-threshold');
   }
 
   async function hydrateOptionFavoriteThreshold() {
@@ -3035,6 +3161,34 @@
     state.optionFavoriteThreshold = threshold;
     input.value = String(threshold);
     await storageSet({ [OPTION_FAVORITE_THRESHOLD_KEY]: threshold });
+  }
+
+  async function hydratePowerFavoriteThreshold() {
+    const stored = await storageGet(POWER_FAVORITE_THRESHOLD_KEY);
+    const threshold = normalizePowerFavoriteThreshold(stored?.[POWER_FAVORITE_THRESHOLD_KEY]);
+    state.powerFavoriteThreshold = threshold;
+    const input = getPowerThresholdInput();
+    if (input) {
+      input.value = String(threshold);
+    }
+  }
+
+  async function handlePowerFavoriteThresholdChange(event) {
+    const threshold = normalizePowerFavoriteThreshold(event?.target?.value);
+    state.powerFavoriteThreshold = threshold;
+    if (event?.target) {
+      event.target.value = String(threshold);
+    }
+    await storageSet({ [POWER_FAVORITE_THRESHOLD_KEY]: threshold });
+  }
+
+  async function persistPowerFavoriteThresholdFromInput() {
+    const input = getPowerThresholdInput();
+    if (!input) return;
+    const threshold = normalizePowerFavoriteThreshold(input.value);
+    state.powerFavoriteThreshold = threshold;
+    input.value = String(threshold);
+    await storageSet({ [POWER_FAVORITE_THRESHOLD_KEY]: threshold });
   }
 
   function getStorageArea() {
@@ -3108,6 +3262,27 @@
       });
 
     state.optionFavoriteResults = entries.map(entry => entry.card);
+    return { threshold, entries };
+  }
+
+  async function collectPowerFavoriteSearchResult() {
+    const threshold = normalizePowerFavoriteThreshold(state.powerFavoriteThreshold);
+    state.powerFavoriteThreshold = threshold;
+
+    const cards = parseAllOwnedInventoryCards();
+    const entries = cards
+      .map(card => ({
+        card,
+        favoriteActive: isInventoryCardFavorited(card),
+      }))
+      .filter(entry => (entry.card?.power || 0) >= threshold)
+      .sort((a, b) => {
+        const powerDiff = (b.card?.power || 0) - (a.card?.power || 0);
+        if (powerDiff !== 0) return powerDiff;
+        return getCardSignatureKey(a.card).localeCompare(getCardSignatureKey(b.card), 'ja');
+      });
+
+    state.powerFavoriteResults = entries.map(entry => entry.card);
     return { threshold, entries };
   }
 
