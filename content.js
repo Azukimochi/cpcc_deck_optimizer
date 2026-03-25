@@ -573,22 +573,6 @@
       };
     });
 
-    document.querySelectorAll('[data-cpcc-action="highlight-work"]').forEach(btn => {
-      btn.onclick = () => {
-        const workName = btn.dataset.work;
-        const single = state.singleResults?.[workName];
-        const plan = state.globalPlan?.byWork?.[workName] || single;
-        if (!plan?.deck?.length) {
-          alert('ハイライト対象のデッキがありません');
-          return;
-        }
-
-        clearAllHighlights();
-        highlightDeck(plan.deck, workName);
-        setStatus(`${workName}: ${plan.deck.length} 枚をハイライトしました`);
-      };
-    });
-
     document.querySelectorAll('.cpcc-result-card').forEach(el => {
       el.onclick = () => {
         const cardId = el.dataset.cpccCardId;
@@ -2344,7 +2328,6 @@
         <div class="cpcc-sub">候補数: ${res.candidateCount} / 探索数: ${formatNum(res.explored)}</div>
         <div class="cpcc-btns">
           <button class="green" data-cpcc-action="set-work" data-work="${escapeHtml(workName)}">このデッキを自動セット</button>
-          <button class="green" data-cpcc-action="highlight-work" data-work="${escapeHtml(workName)}">このデッキをハイライト</button>
         </div>
       </div>
       ${renderDeckCards(res.deck || [], freshDetail)}
