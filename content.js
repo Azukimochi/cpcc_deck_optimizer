@@ -202,8 +202,10 @@
         </div>
       </div>
       <div class="cpcc-card">
-        <div class="cpcc-title">最近引いたSSR</div>
-        <div id="cpcc-recent-ssr"></div>
+        <button id="cpcc-recent-ssr-toggle" class="cpcc-accordion-toggle gray" type="button" aria-expanded="false">最近引いたSSR</button>
+        <div id="cpcc-recent-ssr-wrap" style="display:none;">
+          <div id="cpcc-recent-ssr"></div>
+        </div>
       </div>
       <div id="cpcc-result"></div>
       <div id="cpcc-busy-overlay" style="display:none;">
@@ -312,6 +314,21 @@
         .cpcc-head{font-weight:700;font-size:14px;margin-bottom:8px}
         .cpcc-actions,.cpcc-work-buttons{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px}
         .cpcc-inline{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+        .cpcc-accordion-toggle{
+          width:100%;
+          margin:0;
+          text-align:left;
+          display:flex;
+          align-items:center;
+          justify-content:space-between;
+        }
+        .cpcc-accordion-toggle::after{
+          content:'▸';
+          font-size:12px;
+        }
+        .cpcc-accordion-toggle[aria-expanded="true"]::after{
+          content:'▾';
+        }
         #cpcc-optimizer-root select{
           min-width:160px;
           border:none;
@@ -461,6 +478,14 @@
     root.querySelector('#cpcc-power-threshold').addEventListener('change', handlePowerFavoriteThresholdChange);
     root.querySelector('#cpcc-club-deck-select').addEventListener('change', runClubDeckFavoriteSearch);
     root.querySelector('#cpcc-favorite-all-club-decks').addEventListener('click', favoriteAllClubDecks);
+    root.querySelector('#cpcc-recent-ssr-toggle').addEventListener('click', () => {
+      const toggle = root.querySelector('#cpcc-recent-ssr-toggle');
+      const wrap = root.querySelector('#cpcc-recent-ssr-wrap');
+      if (!toggle || !wrap) return;
+      const expanded = toggle.getAttribute('aria-expanded') === 'true';
+      toggle.setAttribute('aria-expanded', expanded ? 'false' : 'true');
+      wrap.style.display = expanded ? 'none' : '';
+    });
 
     root.querySelectorAll('[data-work]').forEach(btn => {
       btn.addEventListener('click', () => runSingleWork(btn.dataset.work));
