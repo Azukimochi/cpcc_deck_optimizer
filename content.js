@@ -193,7 +193,10 @@
       </div>
       <div id="cpcc-result"></div>
       <div id="cpcc-busy-overlay" style="display:none;">
-        <div class="cpcc-busy-card">お気に入り登録中...</div>
+        <div class="cpcc-busy-card">
+          <div class="cpcc-busy-title">お気に入り登録中...</div>
+          <div class="cpcc-busy-detail"></div>
+        </div>
       </div>
     `;
     document.body.appendChild(root);
@@ -356,6 +359,16 @@
           border-radius:12px;
           box-shadow:0 20px 50px rgba(0,0,0,.35);
           font-weight:700;
+          min-width:280px;
+        }
+        .cpcc-busy-title{
+          font-weight:700;
+        }
+        .cpcc-busy-detail{
+          margin-top:8px;
+          font-size:12px;
+          font-weight:500;
+          color:rgba(255,255,255,.88);
         }
       `;
       document.head.appendChild(style);
@@ -413,9 +426,13 @@
   function setBusyOverlay(visible, text = 'お気に入り登録中...') {
     const overlay = document.getElementById('cpcc-busy-overlay');
     if (!overlay) return;
-    const label = overlay.querySelector('.cpcc-busy-card');
+    const label = overlay.querySelector('.cpcc-busy-title');
     if (label) {
       label.textContent = text;
+    }
+    const detail = overlay.querySelector('.cpcc-busy-detail');
+    if (detail && !visible) {
+      detail.textContent = '';
     }
     overlay.style.display = visible ? '' : 'none';
   }
@@ -424,8 +441,18 @@
     setBusyOverlay(true, `${prefix} ${formatNum(done)}/${formatNum(total)}`);
   }
 
+  function setBusyOverlayDetail(text = '') {
+    const overlay = document.getElementById('cpcc-busy-overlay');
+    if (!overlay) return;
+    const detail = overlay.querySelector('.cpcc-busy-detail');
+    if (detail) {
+      detail.textContent = text;
+    }
+  }
+
   async function runWithBusyOverlay(text, task) {
     setBusyOverlay(true, text);
+    setBusyOverlayDetail('');
     try {
       return await task();
     } finally {
@@ -2707,11 +2734,13 @@
       const summaries = [];
       const uniqueCards = [];
       const seenKeys = new Set();
-      const totalClubs = CLUBS.length;
+      const clubTargets = ['ごちゃまぜ', ...CLUBS];
+      const totalClubs = clubTargets.length;
 
-      for (let index = 0; index < CLUBS.length; index++) {
-        const clubName = CLUBS[index];
+      for (let index = 0; index < clubTargets.length; index++) {
+        const clubName = clubTargets[index];
         updateBusyOverlayProgress(index, totalClubs, 'デッキ計算中');
+        setBusyOverlayDetail(clubName);
         const result = await searchBestFavoriteDeckByClub(clubName, cards, optionScan);
         summaries.push({
           club: clubName,
@@ -2739,6 +2768,7 @@
       for (let index = 0; index < uniqueCards.length; index++) {
         const card = uniqueCards[index];
         updateBusyOverlayProgress(index, uniqueCards.length, '登録中');
+        setBusyOverlayDetail(`${card.name} / Power ${formatNum(card.power)} / ${card.club}`);
         const result = await favoriteCardWithRetry(card);
         if (result === 'already') {
           already++;
