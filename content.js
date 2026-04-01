@@ -106,6 +106,8 @@
     recentSsrRefreshTimer: null,
     recentSsrPollTimer: null,
     recentSsrGlowTimer: null,
+    lastVisibleSection: '',
+    autoReloadFromGachaScheduled: false,
   };
 
   const CACHE_INDEX_KEY = 'cpcc_optimizer_cache_index_v1';
@@ -804,6 +806,11 @@
     const recentWidgetLauncher = document.getElementById('cpcc-recent-ssr-widget-launcher');
     const active = isWorkTabActive();
     const gachaActive = isGachaTabActive();
+    const currentSection = active ? 'work' : gachaActive ? 'gacha' : '';
+    if (state.lastVisibleSection === 'gacha' && currentSection === 'work') {
+      scheduleAutoReloadFromGacha();
+    }
+    state.lastVisibleSection = currentSection;
     updateRecentSsrPolling(gachaActive);
 
     if (!active) {
@@ -839,6 +846,17 @@
     }
 
     updateLauncherVisibility(true);
+  }
+
+  function scheduleAutoReloadFromGacha() {
+    if (state.autoReloadFromGachaScheduled) return;
+    state.autoReloadFromGachaScheduled = true;
+
+    setTimeout(() => {
+      state.autoReloadFromGachaScheduled = false;
+      if (!isWorkTabActive()) return;
+      reloadAll();
+    }, 150);
   }
 
   function updateRecentSsrPolling(gachaActive) {
