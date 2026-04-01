@@ -17,5 +17,16 @@
       ],
       "run_at": "document_idle"
     }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "page-gacha-bridge.js"
+      ],
+      "matches": [
+        "https://korimizu.com/*",
+        "https://april.colorfulparty.jp/*"
+      ]
+    }
   ]
 }

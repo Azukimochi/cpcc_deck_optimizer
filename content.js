@@ -103,7 +103,17 @@
     recentSsrRefreshTimer: null,
     recentSsrPollTimer: null,
     recentSsrGlowTimer: null,
+    gachaMaxPollTimer: null,
+    gachaMaxRefreshInFlight: false,
+    gachaMaxRunning: false,
   };
+
+  const GACHA_PULL_CONFIGS = [
+    { type: 'normal', cost: 10, selector: '#btn-pull-normal-1' },
+    { type: 'rare', cost: 100, selector: '#btn-pull-rare-1' },
+    { type: 'super_rare', cost: 10000, selector: '#btn-pull-sr-1' },
+    { type: 'ssr', cost: 1000000, selector: '#btn-pull-ssr-1' },
+  ];
 
   const CACHE_INDEX_KEY = 'cpcc_optimizer_cache_index_v1';
   const CACHE_KEY_PREFIX = 'cpcc_optimizer_cache_v1:';
@@ -117,11 +127,13 @@
 
   function boot() {
     if (document.getElementById('cpcc-optimizer-root')) return;
+    ensurePageGachaBridge();
     ensureLauncherButton();
     ensureRecentSsrWidget();
     ensureRecentSsrWidgetLauncher();
     createPanel();
     ensureQuickFavoriteButtons();
+    ensureGachaMaxButtons();
     ensureVisibilityObserver();
     reconcileOptimizerVisibility();
     reloadAll();
@@ -476,6 +488,36 @@
         }
         .btn-quick-favorite:hover{filter:brightness(1.06)}
         .btn-quick-favorite:disabled{opacity:.6;cursor:wait}
+        .cpcc-gacha-max-wrap{
+          display:flex;
+          flex-direction:column;
+          gap:6px;
+          margin-top:10px;
+        }
+        .cpcc-gacha-max-btn{
+          width:100%;
+          margin:0;
+          border:none;
+          border-radius:10px;
+          padding:10px 12px;
+          cursor:pointer;
+          background:linear-gradient(180deg,#f59e0b,#d97706);
+          color:#fff;
+          font-size:13px;
+          font-weight:700;
+          box-shadow:0 10px 22px rgba(217,119,6,.22);
+        }
+        .cpcc-gacha-max-btn:hover{filter:brightness(1.05)}
+        .cpcc-gacha-max-btn:disabled{
+          opacity:.65;
+          cursor:not-allowed;
+          box-shadow:none;
+        }
+        .cpcc-gacha-max-meta{
+          font-size:11px;
+          line-height:1.4;
+          color:rgba(15,23,42,.72);
+        }
         #cpcc-busy-overlay{
           position:fixed;
           inset:0;
@@ -706,6 +748,8 @@
     const active = isWorkTabActive();
     const gachaActive = isGachaTabActive();
     updateRecentSsrPolling(gachaActive);
+    updateGachaMaxPolling(gachaActive);
+    ensureGachaMaxButtons();
 
     if (!active) {
       if (root) root.style.display = 'none';
@@ -759,6 +803,23 @@
     }
   }
 
+  function updateGachaMaxPolling(gachaActive) {
+    if (gachaActive) {
+      if (!state.gachaMaxPollTimer) {
+        void refreshGachaMaxButtons();
+        state.gachaMaxPollTimer = setInterval(() => {
+          void refreshGachaMaxButtons();
+        }, 1000);
+      }
+      return;
+    }
+
+    if (state.gachaMaxPollTimer) {
+      clearInterval(state.gachaMaxPollTimer);
+      state.gachaMaxPollTimer = null;
+    }
+  }
+
   function ensureVisibilityObserver() {
     if (state.visibilityObserverStarted) return;
     state.visibilityObserverStarted = true;
@@ -766,6 +827,7 @@
     const observer = new MutationObserver(() => {
       reconcileOptimizerVisibility();
       ensureQuickFavoriteButtons();
+      ensureGachaMaxButtons();
       scheduleRecentSsrRefresh();
     });
 
@@ -2960,6 +3022,162 @@
         }
       });
       actions.appendChild(btn);
+    }
+  }
+
+  function ensurePageGachaBridge() {
+    const marker = document.documentElement;
+    if (!marker || marker.dataset.cpccGachaBridgeInstalled === 'true') return;
+
+    const script = document.createElement('script');
+    script.src = chrome.runtime.getURL('page-gacha-bridge.js');
+
+    (document.documentElement || document.head || document.body).appendChild(script);
+    script.addEventListener('load', () => script.remove(), { once: true });
+    script.addEventListener('error', () => {
+      marker.dataset.cpccGachaBridgeInstalled = '';
+      script.remove();
+    }, { once: true });
+    marker.dataset.cpccGachaBridgeInstalled = 'true';
+  }
+
+  function requestPageGachaBridge(action, extra = {}, timeoutMs = 15000) {
+    ensurePageGachaBridge();
+    return new Promise((resolve, reject) => {
+      const requestId = `cpcc-gacha-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      let done = false;
+      let timer = null;
+
+      const cleanup = () => {
+        if (done) return;
+        done = true;
+        if (timer) clearTimeout(timer);
+        document.removeEventListener('cpcc:gacha-bridge-response', onResponse);
+      };
+
+      const onResponse = (event) => {
+        const detail = event.detail || {};
+        if (detail.requestId !== requestId) return;
+        cleanup();
+        if (detail.ok) {
+          resolve(detail.result);
+          return;
+        }
+        reject(new Error(detail.error || 'Page bridge request failed'));
+      };
+
+      timer = setTimeout(() => {
+        cleanup();
+        reject(new Error('Page bridge request timed out'));
+      }, timeoutMs);
+
+      document.addEventListener('cpcc:gacha-bridge-response', onResponse);
+      document.dispatchEvent(new CustomEvent('cpcc:gacha-bridge-request', {
+        detail: { requestId, action, ...extra },
+      }));
+    });
+  }
+
+  function detectGachaPullConfig(root) {
+    if (!root) return null;
+    return GACHA_PULL_CONFIGS.find(config => !!root.querySelector(config.selector)) || null;
+  }
+
+  function computeMaxPullAmount(status, config) {
+    if (!status || !config) return 0;
+    const cpcp = Math.floor(Number(status.cpcp || 0) + Number(status.pendingClicks || 0));
+    const maxInventory = Math.max(0, Number(status.maxInventory || 1000));
+    const inventoryCount = Math.max(0, Number(status.inventoryCount || 0));
+    const remainingCapacity = Math.max(0, maxInventory - inventoryCount);
+    const affordable = config.cost > 0 ? Math.floor(cpcp / config.cost) : 0;
+    return Math.max(0, Math.min(affordable, remainingCapacity));
+  }
+
+  function ensureGachaMaxButtons() {
+    const banners = [...document.querySelectorAll('#gacha-section .gacha-banner')];
+    banners.forEach(root => {
+      const config = detectGachaPullConfig(root);
+      if (!config) return;
+
+      let wrap = root.querySelector('.cpcc-gacha-max-wrap');
+      if (!wrap) {
+        wrap = document.createElement('div');
+        wrap.className = 'cpcc-gacha-max-wrap';
+        wrap.innerHTML = `
+          <button type="button" class="cpcc-gacha-max-btn" data-cpcc-gacha-max="${escapeHtml(config.type)}">限界まで引く</button>
+          <div class="cpcc-gacha-max-meta" data-cpcc-gacha-meta="${escapeHtml(config.type)}"></div>
+        `;
+        root.appendChild(wrap);
+      }
+
+      const btn = wrap.querySelector('.cpcc-gacha-max-btn');
+      if (!btn || btn.dataset.cpccBound === 'true') return;
+
+      btn.dataset.cpccBound = 'true';
+      btn.addEventListener('click', async () => {
+        if (state.gachaMaxRunning) return;
+
+        state.gachaMaxRunning = true;
+        await refreshGachaMaxButtons({ force: true });
+
+        try {
+          const status = await requestPageGachaBridge('status');
+          const maxAmount = computeMaxPullAmount(status, config);
+          if (status.isAnimating) {
+            alert('ガチャ演出の完了後にもう一度お試しください');
+            return;
+          }
+          if (maxAmount <= 0) {
+            alert('CPCP不足、または所持上限に達しているため引けません');
+            return;
+          }
+
+          await requestPageGachaBridge('pull', {
+            gachaType: config.type,
+            amount: maxAmount,
+          }, 300000);
+        } catch (error) {
+          console.error('[CPCC Optimizer] max gacha pull failed', error);
+          alert(`限界まで引くに失敗しました: ${error instanceof Error ? error.message : String(error)}`);
+        } finally {
+          state.gachaMaxRunning = false;
+          await sleep(100);
+          await refreshGachaMaxButtons({ force: true });
+        }
+      });
+    });
+  }
+
+  async function refreshGachaMaxButtons(options = {}) {
+    if (!isGachaTabActive()) return;
+    if (state.gachaMaxRefreshInFlight && !options.force) return;
+
+    state.gachaMaxRefreshInFlight = true;
+    try {
+      ensureGachaMaxButtons();
+      const status = await requestPageGachaBridge('status');
+      const banners = [...document.querySelectorAll('#gacha-section .gacha-banner')];
+
+      banners.forEach(root => {
+        const config = detectGachaPullConfig(root);
+        if (!config) return;
+
+        const btn = root.querySelector(`[data-cpcc-gacha-max="${config.type}"]`);
+        const meta = root.querySelector(`[data-cpcc-gacha-meta="${config.type}"]`);
+        if (!btn || !meta) return;
+
+        const maxAmount = computeMaxPullAmount(status, config);
+        const cpcp = Math.floor(Number(status.cpcp || 0) + Number(status.pendingClicks || 0));
+        const remainingCapacity = Math.max(0, Number(status.maxInventory || 1000) - Number(status.inventoryCount || 0));
+
+        btn.disabled = state.gachaMaxRunning || !!status.isAnimating || maxAmount <= 0;
+        btn.textContent = maxAmount > 0 ? `限界まで引く (${formatNum(maxAmount)}回)` : '限界まで引く';
+        meta.textContent = `現在 ${formatNum(cpcp)} CPCP / 残り ${formatNum(remainingCapacity)} 枚 / 1回 ${formatNum(config.cost)} CPCP`;
+      });
+    } catch (error) {
+      console.warn('[CPCC Optimizer] failed to refresh gacha max buttons', error);
+    } finally {
+      state.gachaMaxRefreshInFlight = false;
     }
   }
 
